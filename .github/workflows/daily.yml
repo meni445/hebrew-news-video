@@ -1,0 +1,35 @@
+name: Daily news video
+
+on:
+  workflow_dispatch:        # manual run only for now; daily schedule added later
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Collect Telegram posts
+        env:
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
+          TG_SESSION: ${{ secrets.TG_SESSION }}
+          HOURS: "24"
+        run: python collect.py
+
+      - name: Upload output
+        uses: actions/upload-artifact@v4
+        with:
+          name: daily-output
+          path: daily/
+          retention-days: 7
