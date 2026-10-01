@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 import edge_tts
+import requests
 
 VOICE = os.getenv("TTS_VOICE", "he-IL-AvriNeural")   # or he-IL-HilaNeural (female)
 RATE = os.getenv("TTS_RATE", "+0%")                    # e.g. "+5%" faster, "-5%" slower
@@ -14,6 +15,11 @@ PITCH = os.getenv("TTS_PITCH", "+0Hz")                 # e.g. "-8Hz" for a deepe
 PAUSE = float(os.getenv("TTS_PAUSE", "0.6"))           # seconds of silence between parts
 DEEP_EQ = os.getenv("TTS_DEEP_EQ", "0") == "1"         # bass warmth + compression + loudness (off by default)
 PRON_FILE = os.getenv("TTS_PRONUNCIATIONS", "pronunciations.txt")
+NIQQUD = os.getenv("TTS_NIQQUD", "0") == "1"           # automatic niqqud before speaking (off by default)
+NIQQUD_MODEL_URL = os.getenv(
+    "NIQQUD_MODEL_URL",
+    "https://huggingface.co/thewh1teagle/phonikud-onnx/resolve/main/phonikud-1.0.int8.onnx")
+NIQQUD_MODEL_PATH = Path(os.getenv("NIQQUD_MODEL_PATH", "models/phonikud-1.0.int8.onnx"))
 SR = 24000
 
 HEB_MONTHS = ["ינואר", "פברואר", "מרץ", "אפריל", "מאי", "יוני",
@@ -25,6 +31,9 @@ EQ_FILTER = ("equalizer=f=110:t=q:w=1.0:g=3,"
              "equalizer=f=3500:t=q:w=1.0:g=1.5,"
              "acompressor=threshold=-20dB:ratio=3:attack=5:release=120,"
              "loudnorm=I=-14:TP=-1.5:LRA=9")
+
+# standard niqqud + dagesh + shin/sin dots + qamats qatan + maqaf + sof pasuq
+KEEP_MARKS = set(range(0x05B0, 0x05BD)) | {0x05BE, 0x05C1, 0x05C2, 0x05C3, 0x05C7}
 
 
 def load_pronunciations(path):
@@ -46,17 +55,83 @@ def load_pronunciations(path):
 
 PRONUNCIATIONS = load_pronunciations(PRON_FILE)
 
+_nakdan = None  # None = not loaded yet, False = unavailable
+
+
+def get_nakdan():
+    global _nakdan
+    if _nakdan is None:
+        try:
+            from phonikud_onnx import Phonikud
+            if not NIQQUD_MODEL_PATH.exists():
+                NIQQUD_MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
+                print(f"Downloading niqqud model from {NIQQUD_MODEL_URL} ...")
+                tmp = NIQQUD_MODEL_PATH.with_suffix(".part")
+                with requests.get(NIQQUD_MODEL_URL, stream=True, timeout=900) as r:
+                    r.raise_for_status()
+                    with open(tmp, "wb") as f:
+                        for chunk in r.iter_content(1 << 20):
+                            f.write(chunk)
+                tmp.rename(NIQQUD_MODEL_PATH)
+            _nakdan = Phonikud(str(NIQQUD_MODEL_PATH))
+            print("Niqqud model loaded")
+        except Exception as e:
+            print(f"[!] niqqud disabled: {e}")
+            _nakdan = False
+    return _nakdan or None
+
+
+def clean_marks(text):
+    """Keep standard niqqud only; drop Phonikud's extra stress/shva/prefix markers."""
+    out = []
+    for ch in text:
+        cp = ord(ch)
+        if ch == "|":
+            continue
+        if 0x0591 <= cp <= 0x05C7 and cp not in KEEP_MARKS:
+            continue
+        out.append(ch)
+    return "".join(out)
+
+
+def diacritize(text):
+    nak = get_nakdan()
+    if not nak:
+        return text
+    sentences = re.split(r"(?<=[.!?])\s+", text)
+    out = []
+    for s in sentences:
+        if not s.strip():
+            continue
+        try:
+            out.append(clean_marks(nak.add_diacritics(s)))
+        except Exception as e:
+            print(f"  [!] niqqud failed for a sentence ({e}), using plain text")
+            out.append(s)
+    return " ".join(out)
+
 
 def speakable(text):
-    """Prepare text for the voice: dates as words + pronunciation dictionary."""
+    """Dates as words -> protect dictionary words -> niqqud -> restore dictionary words."""
     def repl(m):
         d, mo, y = int(m.group(1)), int(m.group(2)), m.group(3)
         if 1 <= mo <= 12 and 1 <= d <= 31:
             return f"{d} ב{HEB_MONTHS[mo - 1]} {y}"
         return m.group(0)
     text = DATE_RE.sub(repl, text or "")
-    for src, dst in PRONUNCIATIONS:
-        text = text.replace(src, dst)
+
+    tokens = {}
+    for i, (src, dst) in enumerate(PRONUNCIATIONS):
+        if src in text:
+            token = f"PRN{i:03d}X"
+            tokens[token] = dst
+            text = text.replace(src, token)
+
+    if NIQQUD:
+        text = diacritize(text)
+
+    for token, dst in tokens.items():
+        text = text.replace(token, dst)
     return re.sub(r"\s+", " ", text).strip()
 
 
@@ -124,12 +199,15 @@ async def main():
     run(["ffmpeg", "-y", "-f", "lavfi", "-i", f"anullsrc=r={SR}:cl=mono",
          "-t", str(PAUSE), str(silence)])
 
-    print(f"Voice: {VOICE}, rate {RATE}, pitch {PITCH}, deep EQ {'on' if DEEP_EQ else 'off'}")
+    print(f"Voice: {VOICE}, rate {RATE}, pitch {PITCH}, deep EQ {'on' if DEEP_EQ else 'off'}, "
+          f"niqqud {'on' if NIQQUD else 'off'}")
     print(f"Pronunciation rules loaded: {len(PRONUNCIATIONS)}")
     t = 0.0
     concat_lines = []
+    spoken_dump = []
     for idx, p in enumerate(parts):
         text = speakable(p["text"])
+        spoken_dump.append(f"--- {p['id']} ---\n{text}")
         mp3 = audio_dir / f"{p['id']}.mp3"
         wav = audio_dir / f"{p['id']}.wav"
         srt = audio_dir / f"{p['id']}.srt"
@@ -147,6 +225,8 @@ async def main():
             concat_lines.append(f"file '{silence.name}'")
             t += PAUSE
 
+    (audio_dir / "spoken.txt").write_text("\n\n".join(spoken_dump), encoding="utf-8")
+
     list_file = audio_dir / "concat.txt"
     list_file.write_text("\n".join(concat_lines) + "\n", encoding="utf-8")
 
@@ -162,7 +242,8 @@ async def main():
     run(cmd)
 
     manifest = {"voice": VOICE, "rate": RATE, "pitch": PITCH, "deep_eq": DEEP_EQ,
-                "pause": PAUSE, "total_duration": round(duration(narration), 3),
+                "niqqud": NIQQUD and bool(_nakdan), "pause": PAUSE,
+                "total_duration": round(duration(narration), 3),
                 "narration": "audio/narration.mp3", "parts": parts}
     (day_dir / "audio.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2),
                                         encoding="utf-8")
