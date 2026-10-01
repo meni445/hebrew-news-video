@@ -1,17 +1,29 @@
 import json
 import os
+import re
 import sys
 import time
+from datetime import date
 from pathlib import Path
 
 import requests
 
 MODELS = [m.strip() for m in os.getenv("GEMINI_MODEL", "gemini-3.8-flash").split(",") if m.strip()]
 RETRIES_PER_MODEL = int(os.getenv("GEMINI_RETRIES", "3"))
+RETRY_WAIT = int(os.getenv("GEMINI_WAIT", "20"))          # seconds, grows each retry
+PROOFREAD = os.getenv("PROOFREAD", "0") == "1"             # off by default
 TARGET_MINUTES = float(os.getenv("TARGET_MINUTES", "5"))
 MAX_STORIES = int(os.getenv("MAX_STORIES", "8"))
 MAX_POST_CHARS = int(os.getenv("MAX_POST_CHARS", "700"))
 WORDS_PER_MIN = 130  # approx. Hebrew speaking pace
+
+HEB_DAYS = ["שני", "שלישי", "רביעי", "חמישי", "שישי", "שבת", "ראשון"]  # Monday=0
+
+# Arabic, Cyrillic, Hangul, Japanese, CJK - should never appear in the Hebrew script
+FOREIGN = re.compile(
+    r"[\u0600-\u06FF\u0750-\u077F\u0400-\u04FF\u1100-\u11FF"
+    r"\u3040-\u30FF\u3130-\u318F\u4E00-\u9FFF\uAC00-\uD7AF]+"
+)
 
 PROMPT = """You are the editor of a daily Hebrew news video for YouTube.
 Below are the last 24 hours of posts from several Hebrew Telegram news channels.
@@ -20,20 +32,34 @@ Many posts repeat the same story.
 Tasks:
 1. Group posts about the same event into one story. Ignore ads, promotions,
    channel self-promotion, greetings and posts with no news value.
-2. Pick the __MAX_STORIES__ most important stories. Prefer stories reported by
-   several channels or with high views. Order from most to least important.
+2. Pick up to __MAX_STORIES__ of the most important stories. Prefer stories
+   reported by several channels or with high views. Order from most to least important.
 3. Write a script for a presenter who reads it aloud, in natural spoken Hebrew.
+
+Rules for the stories:
+- Each event appears in exactly ONE story. Never split one event (or its
+  reactions and follow-ups) into two stories.
+- Skip vague stories without concrete facts. Fewer, solid stories are better
+  than filler.
+- Headlines must be specific: name the country, city or body involved.
 
 Rules for the narration:
 - Hebrew only. Neutral, factual tone. No opinions.
-- A claim from a single unconfirmed source must be attributed
-  (e.g. "לפי דיווחים", "על פי פרסומים ברשתות"). Never present rumors as fact.
+- Write ONLY Hebrew letters, digits and basic punctuation. Never use characters
+  from Arabic, Korean, Chinese, Russian or any other script.
+- Check spelling and grammar carefully.
+- Say "לפי דיווח רשמי" only when an official body is named in the posts
+  (e.g. דובר צה"ל, משרד החוץ, משטרת ישראל) and name that body.
+  Otherwise attribute with "לפי דיווחים" or "על פי פרסומים ברשתות".
+  Never present rumors as fact.
 - No graphic descriptions of violence or injuries. Do not name wounded or
   killed people unless the name was officially published.
 - Spoken style: short sentences. No emojis, hashtags, links or bullet symbols.
   Avoid abbreviations except very common ones (צה"ל, ארה"ב).
-- Total narration about __WORDS__ words (about __MINUTES__ minutes).
-- The intro greets viewers and says this is the news summary for __DATE__.
+- Total narration (intro + all stories + outro) MUST be between __MIN_WORDS__
+  and __WORDS__ words (about __MINUTES__ minutes). Give important stories more detail.
+- The intro greets viewers and says this is the news summary for
+  יום __WEEKDAY__, __DATE__. Use exactly this day and date.
 - The outro is one or two short sentences asking to subscribe.
 
 Return ONLY valid JSON, no markdown, in exactly this shape:
@@ -54,6 +80,22 @@ Return ONLY valid JSON, no markdown, in exactly this shape:
 
 POSTS:
 __POSTS__
+"""
+
+PROOF_PROMPT = """You are a Hebrew copy editor. Below is a JSON news script that
+will be read aloud by a Hebrew text-to-speech voice.
+
+Fix ONLY:
+- spelling and grammar mistakes and typos
+- any characters that are not Hebrew (Arabic, Korean, Chinese, Cyrillic etc.):
+  replace them with the correct Hebrew word that fits the sentence
+
+Do NOT add, remove, merge or reorder stories. Do NOT change facts, names,
+numbers or attributions. Keep exactly the same JSON keys and the same number
+of segments. Return ONLY the corrected JSON, no markdown.
+
+JSON:
+__JSON__
 """
 
 
@@ -88,13 +130,14 @@ def short_error(r):
         return r.text[:200]
 
 
-def call_gemini(prompt, api_key):
+def call_gemini(prompt, api_key, models):
+    """Returns (text, model) or (None, None) if every model failed."""
     headers = {"x-goog-api-key": api_key, "Content-Type": "application/json"}
     body = {
         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
         "generationConfig": {"responseMimeType": "application/json", "temperature": 0.4},
     }
-    for model in MODELS:
+    for model in models:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
         print(f"Trying model: {model}")
         for attempt in range(RETRIES_PER_MODEL):
@@ -113,14 +156,17 @@ def call_gemini(prompt, api_key):
                     print(f"  unexpected response: {json.dumps(data, ensure_ascii=False)[:300]}")
                     break
             if r.status_code in (429, 500, 502, 503, 504):
-                wait = 20 * (attempt + 1)
+                if attempt == RETRIES_PER_MODEL - 1:
+                    print(f"  HTTP {r.status_code}: {short_error(r)}")
+                    break
+                wait = min(RETRY_WAIT * (attempt + 1), 300)
                 print(f"  HTTP {r.status_code}: {short_error(r)} -> retry in {wait}s")
                 time.sleep(wait)
                 continue
             print(f"  HTTP {r.status_code}: {short_error(r)} -> next model")
             break
         print(f"  giving up on {model}")
-    sys.exit("All Gemini models failed")
+    return None, None
 
 
 def parse_json(text):
@@ -130,6 +176,58 @@ def parse_json(text):
         text = text[text.find("{"):]
     text = text[: text.rfind("}") + 1]
     return json.loads(text)
+
+
+def proofread(script, api_key, model):
+    subset = {
+        "intro": script.get("intro", ""),
+        "segments": [{"headline": s.get("headline", ""), "narration": s.get("narration", "")}
+                     for s in script["segments"]],
+        "outro": script.get("outro", ""),
+    }
+    prompt = PROOF_PROMPT.replace("__JSON__", json.dumps(subset, ensure_ascii=False, indent=2))
+    print("Proofreading...")
+    raw, _ = call_gemini(prompt, api_key, [model])
+    if raw is None:
+        print("  proofread failed, keeping original")
+        return script
+    try:
+        fixed = parse_json(raw)
+    except Exception as e:
+        print(f"  proofread returned invalid JSON ({e}), keeping original")
+        return script
+    if len(fixed.get("segments", [])) != len(script["segments"]):
+        print("  proofread changed the number of segments, keeping original")
+        return script
+    script["intro"] = fixed.get("intro") or script.get("intro", "")
+    script["outro"] = fixed.get("outro") or script.get("outro", "")
+    for orig, new in zip(script["segments"], fixed["segments"]):
+        orig["headline"] = new.get("headline") or orig.get("headline", "")
+        orig["narration"] = new.get("narration") or orig.get("narration", "")
+    print("  proofread applied")
+    return script
+
+
+def clean_text(text, where, warnings):
+    found = FOREIGN.findall(text or "")
+    if found:
+        warnings.append(f"{where}: removed {found}")
+        text = FOREIGN.sub("", text)
+        text = re.sub(r"[ \t]{2,}", " ", text)
+    return text
+
+
+def clean_script(script):
+    warnings = []
+    for key in ("title", "description", "intro", "outro"):
+        script[key] = clean_text(script.get(key, ""), key, warnings)
+    for i, s in enumerate(script["segments"], 1):
+        s["headline"] = clean_text(s.get("headline", ""), f"segment {i} headline", warnings)
+        s["narration"] = clean_text(s.get("narration", ""), f"segment {i} narration", warnings)
+    script["tags"] = [clean_text(t, "tag", warnings) for t in script.get("tags", [])]
+    for w in warnings:
+        print(f"[!] foreign characters {w}")
+    return script
 
 
 def main():
@@ -145,20 +243,31 @@ def main():
 
     y, m, d = day_dir.name.split("-")
     date_he = f"{d}.{m}.{y}"
+    weekday_he = HEB_DAYS[date(int(y), int(m), int(d)).weekday()]
     words = int(TARGET_MINUTES * WORDS_PER_MIN)
+    min_words = int(words * 0.85)
 
     prompt = (PROMPT.replace("__MAX_STORIES__", str(MAX_STORIES))
+                    .replace("__MIN_WORDS__", str(min_words))
                     .replace("__WORDS__", str(words))
                     .replace("__MINUTES__", f"{TARGET_MINUTES:g}")
+                    .replace("__WEEKDAY__", weekday_he)
                     .replace("__DATE__", date_he)
                     .replace("__POSTS__", posts_text))
 
     print(f"Sending {n} unique posts...")
-    raw, used_model = call_gemini(prompt, api_key)
+    raw, used_model = call_gemini(prompt, api_key, MODELS)
+    if raw is None:
+        sys.exit("All Gemini models failed")
     script = parse_json(raw)
 
     if not script.get("segments"):
         sys.exit("Gemini returned no segments")
+
+    if PROOFREAD:
+        script = proofread(script, api_key, used_model)
+
+    script = clean_script(script)
 
     channels = ", ".join(sorted(data.get("channels", {}).keys()))
     script["description"] = (
@@ -167,6 +276,7 @@ def main():
         + "\nהסרטון נוצר בסיוע בינה מלאכותית."
     )
     script["date"] = date_he
+    script["weekday"] = weekday_he
     script["model"] = used_model
 
     (day_dir / "script.json").write_text(json.dumps(script, ensure_ascii=False, indent=2), encoding="utf-8")
