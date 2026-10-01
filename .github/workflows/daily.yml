@@ -25,6 +25,12 @@ jobs:
           pip install -r requirements.txt
           which ffmpeg || (sudo apt-get update && sudo apt-get install -y ffmpeg)
 
+      - name: Cache niqqud model
+        uses: actions/cache@v4
+        with:
+          path: models
+          key: phonikud-1.0-int8
+
       - name: Collect Telegram posts
         env:
           TG_API_ID: ${{ secrets.TG_API_ID }}
@@ -50,6 +56,7 @@ jobs:
           TTS_RATE: "+0%"
           TTS_PITCH: "-8Hz"
           TTS_DEEP_EQ: "1"
+          TTS_NIQQUD: "1"
           TTS_PAUSE: "0.6"
         run: python tts.py
 
