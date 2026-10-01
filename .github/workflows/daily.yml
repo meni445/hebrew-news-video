@@ -1,12 +1,16 @@
 name: Daily news video
 
 on:
-  workflow_dispatch:        # manual run only for now; daily schedule added later
+  workflow_dispatch:
+  # Daily schedule - enable once the upload step works (remove the # on the next 2 lines).
+  # GitHub cron is UTC: 01:00 UTC = 04:00 Israel summer time / 03:00 winter time.
+  # schedule:
+  #   - cron: "0 1 * * *"
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 180
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -31,6 +35,9 @@ jobs:
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GEMINI_MODEL: "gemini-3.8-flash,gemini-flash-latest,gemini-flash-lite-latest"
+          GEMINI_RETRIES: "6"
+          GEMINI_WAIT: "60"
+          PROOFREAD: "1"
           TARGET_MINUTES: "5"
           MAX_STORIES: "8"
         run: python script.py
