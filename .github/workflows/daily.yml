@@ -48,6 +48,8 @@ jobs:
         env:
           TTS_VOICE: "he-IL-AvriNeural"
           TTS_RATE: "+0%"
+          TTS_PITCH: "-8Hz"
+          TTS_DEEP_EQ: "1"
           TTS_PAUSE: "0.6"
         run: python tts.py
 
