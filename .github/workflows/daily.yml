@@ -27,7 +27,15 @@ jobs:
           HOURS: "24"
         run: python collect.py
 
+      - name: Write Hebrew script (Gemini)
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          TARGET_MINUTES: "5"
+          MAX_STORIES: "8"
+        run: python script.py
+
       - name: Upload output
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: daily-output
