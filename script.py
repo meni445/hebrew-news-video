@@ -6,7 +6,8 @@ from pathlib import Path
 
 import requests
 
-MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+MODELS = [m.strip() for m in os.getenv("GEMINI_MODEL", "gemini-3.8-flash").split(",") if m.strip()]
+RETRIES_PER_MODEL = int(os.getenv("GEMINI_RETRIES", "3"))
 TARGET_MINUTES = float(os.getenv("TARGET_MINUTES", "5"))
 MAX_STORIES = int(os.getenv("MAX_STORIES", "8"))
 MAX_POST_CHARS = int(os.getenv("MAX_POST_CHARS", "700"))
@@ -80,28 +81,46 @@ def build_posts_text(posts):
     return "\n\n".join(lines), len(lines)
 
 
+def short_error(r):
+    try:
+        return r.json()["error"]["message"][:200]
+    except Exception:
+        return r.text[:200]
+
+
 def call_gemini(prompt, api_key):
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent"
     headers = {"x-goog-api-key": api_key, "Content-Type": "application/json"}
     body = {
         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
         "generationConfig": {"responseMimeType": "application/json", "temperature": 0.4},
     }
-    for attempt in range(5):
-        r = requests.post(url, headers=headers, json=body, timeout=300)
-        if r.status_code in (429, 500, 502, 503, 504):
-            wait = 20 * (attempt + 1)
-            print(f"Gemini HTTP {r.status_code}, retrying in {wait}s")
-            time.sleep(wait)
-            continue
-        if r.status_code != 200:
-            sys.exit(f"Gemini error {r.status_code}: {r.text[:1000]}")
-        data = r.json()
-        try:
-            return "".join(part.get("text", "") for part in data["candidates"][0]["content"]["parts"])
-        except (KeyError, IndexError):
-            sys.exit(f"Unexpected Gemini response: {json.dumps(data, ensure_ascii=False)[:1000]}")
-    sys.exit("Gemini failed after retries")
+    for model in MODELS:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+        print(f"Trying model: {model}")
+        for attempt in range(RETRIES_PER_MODEL):
+            try:
+                r = requests.post(url, headers=headers, json=body, timeout=300)
+            except requests.RequestException as e:
+                print(f"  network error: {e}")
+                time.sleep(15)
+                continue
+            if r.status_code == 200:
+                data = r.json()
+                try:
+                    text = "".join(part.get("text", "") for part in data["candidates"][0]["content"]["parts"])
+                    return text, model
+                except (KeyError, IndexError):
+                    print(f"  unexpected response: {json.dumps(data, ensure_ascii=False)[:300]}")
+                    break
+            if r.status_code in (429, 500, 502, 503, 504):
+                wait = 20 * (attempt + 1)
+                print(f"  HTTP {r.status_code}: {short_error(r)} -> retry in {wait}s")
+                time.sleep(wait)
+                continue
+            print(f"  HTTP {r.status_code}: {short_error(r)} -> next model")
+            break
+        print(f"  giving up on {model}")
+    sys.exit("All Gemini models failed")
 
 
 def parse_json(text):
@@ -134,8 +153,9 @@ def main():
                     .replace("__DATE__", date_he)
                     .replace("__POSTS__", posts_text))
 
-    print(f"Sending {n} unique posts to {MODEL}...")
-    script = parse_json(call_gemini(prompt, api_key))
+    print(f"Sending {n} unique posts...")
+    raw, used_model = call_gemini(prompt, api_key)
+    script = parse_json(raw)
 
     if not script.get("segments"):
         sys.exit("Gemini returned no segments")
@@ -147,6 +167,7 @@ def main():
         + "\nהסרטון נוצר בסיוע בינה מלאכותית."
     )
     script["date"] = date_he
+    script["model"] = used_model
 
     (day_dir / "script.json").write_text(json.dumps(script, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -158,6 +179,7 @@ def main():
     (day_dir / "script.txt").write_text(full, encoding="utf-8")
 
     total_words = len(full.split())
+    print(f"Model used: {used_model}")
     print(f"Title: {script.get('title')}")
     print(f"Stories: {len(script['segments'])}, words: {total_words}, "
           f"~{total_words / WORDS_PER_MIN:.1f} min")
