@@ -30,7 +30,7 @@ jobs:
       - name: Write Hebrew script (Gemini)
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          GEMINI_MODEL: "gemini-3.8-flash"
+          GEMINI_MODEL: "gemini-3.8-flash,gemini-flash-latest,gemini-flash-lite-latest"
           TARGET_MINUTES: "5"
           MAX_STORIES: "8"
         run: python script.py
