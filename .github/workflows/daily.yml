@@ -21,7 +21,9 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: |
+          pip install -r requirements.txt
+          which ffmpeg || (sudo apt-get update && sudo apt-get install -y ffmpeg)
 
       - name: Collect Telegram posts
         env:
@@ -41,6 +43,13 @@ jobs:
           TARGET_MINUTES: "5"
           MAX_STORIES: "8"
         run: python script.py
+
+      - name: Hebrew voice (edge-tts)
+        env:
+          TTS_VOICE: "he-IL-AvriNeural"
+          TTS_RATE: "+0%"
+          TTS_PAUSE: "0.6"
+        run: python tts.py
 
       - name: Upload output
         if: always()
