@@ -23,7 +23,8 @@ jobs:
       - name: Install dependencies
         run: |
           pip install -r requirements.txt
-          which ffmpeg || (sudo apt-get update && sudo apt-get install -y ffmpeg)
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg fonts-noto-core
 
       - name: Cache niqqud model
         uses: actions/cache@v4
@@ -63,6 +64,12 @@ jobs:
           TTS_NIQQUD: "0"
           TTS_PAUSE: "0.6"
         run: python tts.py
+
+      - name: Render video
+        env:
+          CHANNEL_NAME: "חדשות היום"
+          PRESENTER_VIDEO: "assets/presenter.mp4"
+        run: python render.py
 
       - name: Upload output
         if: always()
