@@ -50,13 +50,17 @@ jobs:
           MAX_STORIES: "8"
         run: python script.py
 
-      - name: Hebrew voice (edge-tts)
+      - name: Hebrew voice (Gemini TTS, Edge fallback)
         env:
+          TTS_ENGINE: "gemini"
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_TTS_MODEL: "gemini-3.8-flash-lite-tts,gemini-3.1-flash-tts"
+          GEMINI_TTS_VOICE: "Zubenelgenubi"
+          GEMINI_TTS_STYLE: "Read the following Hebrew news text aloud in Hebrew, exactly as written, in a friendly, warm and calm male news presenter voice, at a steady pace"
           TTS_VOICE: "he-IL-AvriNeural"
-          TTS_RATE: "+0%"
           TTS_PITCH: "-8Hz"
           TTS_DEEP_EQ: "1"
-          TTS_NIQQUD: "1"
+          TTS_NIQQUD: "0"
           TTS_PAUSE: "0.6"
         run: python tts.py
 
