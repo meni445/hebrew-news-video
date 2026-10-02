@@ -12,6 +12,7 @@ MODELS = [m.strip() for m in os.getenv("GEMINI_MODEL", "gemini-3.8-flash").split
 RETRIES_PER_MODEL = int(os.getenv("GEMINI_RETRIES", "3"))
 RETRY_WAIT = int(os.getenv("GEMINI_WAIT", "20"))          # seconds, grows each retry
 PROOFREAD = os.getenv("PROOFREAD", "0") == "1"             # off by default
+SCRIPT_ATTEMPTS = int(os.getenv("SCRIPT_ATTEMPTS", "3"))   # re-ask if the JSON is broken
 TARGET_MINUTES = float(os.getenv("TARGET_MINUTES", "5"))
 MAX_STORIES = int(os.getenv("MAX_STORIES", "8"))
 MAX_POST_CHARS = int(os.getenv("MAX_POST_CHARS", "700"))
@@ -24,6 +25,10 @@ FOREIGN = re.compile(
     r"[\u0600-\u06FF\u0750-\u077F\u0400-\u04FF\u1100-\u11FF"
     r"\u3040-\u30FF\u3130-\u318F\u4E00-\u9FFF\uAC00-\uD7AF]+"
 )
+# ASCII double quote between two Hebrew letters (e.g. צה"ל) - breaks JSON
+HEB_QUOTE = re.compile(r'(?<=[\u05D0-\u05EA])"(?=[\u05D0-\u05EA])')
+GERSHAYIM = "\u05F4"   # ״
+GERESH = "\u05F3"      # ׳
 
 PROMPT = """You are the editor of a daily Hebrew news video for YouTube.
 Below are the last 24 hours of posts from several Hebrew Telegram news channels.
@@ -47,15 +52,18 @@ Rules for the narration:
 - Hebrew only. Neutral, factual tone. No opinions.
 - Write ONLY Hebrew letters, digits and basic punctuation. Never use characters
   from Arabic, Korean, Chinese, Russian or any other script.
+- Hebrew acronyms MUST use the Hebrew gershayim character ״ (e.g. צה״ל, ארה״ב,
+  נתב״ג), NEVER the ASCII double quote character. ASCII double quotes inside
+  text break the JSON.
 - Check spelling and grammar carefully.
 - Say "לפי דיווח רשמי" only when an official body is named in the posts
-  (e.g. דובר צה"ל, משרד החוץ, משטרת ישראל) and name that body.
+  (e.g. דובר צה״ל, משרד החוץ, משטרת ישראל) and name that body.
   Otherwise attribute with "לפי דיווחים" or "על פי פרסומים ברשתות".
   Never present rumors as fact.
 - No graphic descriptions of violence or injuries. Do not name wounded or
   killed people unless the name was officially published.
 - Spoken style: short sentences. No emojis, hashtags, links or bullet symbols.
-  Avoid abbreviations except very common ones (צה"ל, ארה"ב).
+  Avoid abbreviations except very common ones (צה״ל, ארה״ב).
 - Total narration (intro + all stories + outro) MUST be between __MIN_WORDS__
   and __WORDS__ words (about __MINUTES__ minutes). Give important stories more detail.
 - The intro greets viewers and says this is the news summary for
@@ -92,7 +100,8 @@ Fix ONLY:
 
 Do NOT add, remove, merge or reorder stories. Do NOT change facts, names,
 numbers or attributions. Keep exactly the same JSON keys and the same number
-of segments. Return ONLY the corrected JSON, no markdown.
+of segments. Hebrew acronyms must use the gershayim character ״ (e.g. צה״ל),
+never the ASCII double quote. Return ONLY the corrected JSON, no markdown.
 
 JSON:
 __JSON__
@@ -170,12 +179,44 @@ def call_gemini(prompt, api_key, models):
 
 
 def parse_json(text):
+    """Parse model output; repair ASCII quotes inside Hebrew acronyms if needed."""
     text = text.strip()
     if text.startswith("```"):
         text = text.strip("`")
         text = text[text.find("{"):]
     text = text[: text.rfind("}") + 1]
-    return json.loads(text)
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as first_error:
+        repaired = HEB_QUOTE.sub(GERSHAYIM, text)
+        try:
+            data = json.loads(repaired)
+            print("  [i] repaired ASCII quotes inside Hebrew acronyms")
+            return data
+        except json.JSONDecodeError:
+            raise first_error
+
+
+def generate_script(prompt, api_key):
+    """Call the model chain once, then re-ask the working model if JSON is broken."""
+    raw, used_model = call_gemini(prompt, api_key, MODELS)
+    if raw is None:
+        sys.exit("All Gemini models failed")
+    for attempt in range(1, SCRIPT_ATTEMPTS + 1):
+        try:
+            script = parse_json(raw)
+            if script.get("segments"):
+                return script, used_model
+            print(f"  [!] attempt {attempt}: no segments in response")
+        except json.JSONDecodeError as e:
+            print(f"  [!] attempt {attempt}: invalid JSON ({e})")
+        if attempt == SCRIPT_ATTEMPTS:
+            break
+        print(f"  re-asking {used_model}...")
+        raw, _ = call_gemini(prompt, api_key, [used_model])
+        if raw is None:
+            break
+    sys.exit("Could not get a valid script from Gemini")
 
 
 def proofread(script, api_key, model):
@@ -209,7 +250,8 @@ def proofread(script, api_key, model):
 
 
 def clean_text(text, where, warnings):
-    found = FOREIGN.findall(text or "")
+    text = (text or "").replace(GERSHAYIM, '"').replace(GERESH, "'")
+    found = FOREIGN.findall(text)
     if found:
         warnings.append(f"{where}: removed {found}")
         text = FOREIGN.sub("", text)
@@ -256,13 +298,7 @@ def main():
                     .replace("__POSTS__", posts_text))
 
     print(f"Sending {n} unique posts...")
-    raw, used_model = call_gemini(prompt, api_key, MODELS)
-    if raw is None:
-        sys.exit("All Gemini models failed")
-    script = parse_json(raw)
-
-    if not script.get("segments"):
-        sys.exit("Gemini returned no segments")
+    script, used_model = generate_script(prompt, api_key)
 
     if PROOFREAD:
         script = proofread(script, api_key, used_model)
