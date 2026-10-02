@@ -24,13 +24,13 @@ jobs:
         run: |
           pip install -r requirements.txt
           sudo apt-get update
-          sudo apt-get install -y ffmpeg fonts-noto-core
+          sudo apt-get install -y ffmpeg fonts-noto-core fonts-dejavu-core
 
-      - name: Cache niqqud model
+      - name: Cache models and fonts
         uses: actions/cache@v4
         with:
           path: models
-          key: phonikud-1.0-int8
+          key: phonikud-1.0-int8-heebo
 
       - name: Collect Telegram posts
         env:
