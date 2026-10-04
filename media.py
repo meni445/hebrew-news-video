@@ -14,25 +14,31 @@ from telethon import TelegramClient
 from telethon.sessions import StringSession
 
 ENABLED = os.getenv("MEDIA_ENABLED", "0") == "1"            # off by default
-PER_SEGMENT = int(os.getenv("MEDIA_PER_SEGMENT", "2"))
+CANDIDATES = int(os.getenv("MEDIA_CANDIDATES", "4"))         # downloaded per story
+PER_SEGMENT = int(os.getenv("MEDIA_PER_SEGMENT", "2"))       # kept per story after the check
 MAX_MB = float(os.getenv("MEDIA_MAX_MB", "40"))
 MAX_VIDEO_SEC = float(os.getenv("MEDIA_MAX_VIDEO_SEC", "120"))
-SAFETY = os.getenv("MEDIA_SAFETY", "0") == "1"              # Gemini check for graphic content
+SAFETY = os.getenv("MEDIA_SAFETY", "0") == "1"              # Gemini check: safety + logos + relevance
 SAFETY_MODELS = [m.strip() for m in os.getenv("GEMINI_SAFETY_MODEL", "gemini-flash-lite-latest").split(",")
                  if m.strip()]
 
-SAFETY_PROMPT = """You review images for a family-safe YouTube news channel.
-For each numbered image, decide if it is UNSAFE to show.
+CHECK_PROMPT = """You check images for a family-safe Hebrew YouTube news video.
+Each image is listed with the Hebrew headline of the story it is meant to illustrate.
+Some images are a strip of 3 frames from one video - judge all 3 frames.
 
-UNSAFE: blood, gore, dead or injured bodies, wounded people, graphic violence,
-executions, torture, hostages in distress, nudity, close-ups of victims.
+Give each image exactly one verdict:
+- "unsafe": blood, gore, dead or injured bodies, wounded people, graphic violence,
+  executions, torture, hostages in distress, nudity, close-ups of victims.
+- "reject": channel logos or channel branding graphics, greeting cards
+  (e.g. שבוע טוב, בוקר טוב, שבת שלום), ads or promotions, screenshots of text or
+  social media posts, images that are mostly text, memes, or images clearly
+  unrelated to the headline.
+- "ok": real news photos or footage that fit the story: soldiers, weapons,
+  vehicles, aircraft, explosions or smoke seen from a distance, damaged buildings
+  without victims, politicians, press conferences, maps, crowds, protests without injuries.
 
-SAFE: soldiers, weapons, military vehicles, aircraft, explosions or smoke seen
-from a distance, damaged buildings without victims, politicians, press
-conferences, maps, text graphics, crowds, protests without injuries.
-
-When in doubt, mark it UNSAFE.
-Return ONLY JSON: {"unsafe": [list of image numbers]}"""
+When in doubt between "ok" and "unsafe", choose "unsafe".
+Return ONLY JSON: {"verdicts": {"1": "ok", "2": "reject", "3": "unsafe"}}"""
 
 
 def env(name):
@@ -69,7 +75,7 @@ async def download_all(day_dir, script):
             seg_id = f"seg{i:02d}"
             items, seen = [], set()
             for sid in seg.get("source_ids", []):
-                if len(items) >= PER_SEGMENT:
+                if len(items) >= CANDIDATES:
                     break
                 try:
                     channel, msg_id = sid.split("/")
@@ -82,7 +88,7 @@ async def download_all(day_dir, script):
                     print(f"  [!] {sid}: {e}")
                     continue
                 for m in msgs:
-                    if len(items) >= PER_SEGMENT:
+                    if len(items) >= CANDIDATES:
                         break
                     if (channel, m.id) in seen:
                         continue
@@ -106,106 +112,112 @@ async def download_all(day_dir, script):
                         items.append({"file": str(Path(path).relative_to(day_dir)),
                                       "type": kind, "source": f"{channel}/{m.id}"})
             result[seg_id] = items
-            print(f"{seg_id}: {len(items)} media")
+            print(f"{seg_id}: {len(items)} candidates")
     return result
 
 
+def video_duration(path):
+    r = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                        "-of", "default=nw=1:nk=1", str(path)], capture_output=True, text=True)
+    try:
+        return float(r.stdout.strip())
+    except ValueError:
+        return 0.0
+
+
 def preview_jpeg(day_dir, item):
+    """Photo -> the photo. Video -> strip of 3 frames (10%, 50%, 90%)."""
     src = day_dir / item["file"]
-    if item["type"] == "video":
-        frame = src.with_suffix(".preview.jpg")
-        for ss in ("1", "0"):
-            r = subprocess.run(["ffmpeg", "-y", "-ss", ss, "-i", str(src), "-frames:v", "1", str(frame)],
+    if item["type"] == "photo":
+        img = Image.open(src).convert("RGB")
+        img.thumbnail((640, 640))
+    else:
+        dur = video_duration(src)
+        frames = []
+        for k, frac in enumerate((0.1, 0.5, 0.9)):
+            ts = max(0.0, dur * frac) if dur else k
+            out = src.with_name(f"{src.stem}.f{k}.jpg")
+            r = subprocess.run(["ffmpeg", "-y", "-ss", f"{ts:.2f}", "-i", str(src),
+                                "-frames:v", "1", str(out)],
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            if r.returncode == 0 and frame.exists():
-                break
-        src = frame
-    img = Image.open(src).convert("RGB")
-    img.thumbnail((512, 512))
+            if r.returncode == 0 and out.exists():
+                f = Image.open(out).convert("RGB")
+                f.thumbnail((360, 360))
+                frames.append(f)
+        if not frames:
+            raise RuntimeError("no frames extracted")
+        w = sum(f.width for f in frames) + 10 * (len(frames) - 1)
+        h = max(f.height for f in frames)
+        img = Image.new("RGB", (w, h), (0, 0, 0))
+        x = 0
+        for f in frames:
+            img.paste(f, (x, 0))
+            x += f.width + 10
     buf = io.BytesIO()
     img.save(buf, "JPEG", quality=80)
     return base64.b64encode(buf.getvalue()).decode()
 
 
-def safety_filter(day_dir, media):
+def check_media(day_dir, script, media):
+    headlines = {f"seg{i:02d}": s.get("headline", "") for i, s in enumerate(script["segments"], 1)}
     flat = [(seg, it) for seg, items in media.items() for it in items]
     if not flat:
         return media
-    parts = [{"text": SAFETY_PROMPT}]
-    for n, (_, it) in enumerate(flat, 1):
+    parts = [{"text": CHECK_PROMPT}]
+    for n, (seg, it) in enumerate(flat, 1):
+        it["_n"] = n
         try:
             data = preview_jpeg(day_dir, it)
         except Exception as e:
-            print(f"  [!] preview failed for {it['source']}: {e} - marking unsafe")
+            print(f"  [!] preview failed for {it['source']}: {e}")
             data = None
-        it["_n"] = n
-        it["_ok_preview"] = data is not None
+        it["_has_preview"] = data is not None
         if data:
-            parts.append({"text": f"Image {n}:"})
+            parts.append({"text": f"Image {n} - headline: {headlines.get(seg, '')}"})
             parts.append({"inlineData": {"mimeType": "image/jpeg", "data": data}})
 
     headers = {"x-goog-api-key": env("GEMINI_API_KEY"), "Content-Type": "application/json"}
     body = {"contents": [{"role": "user", "parts": parts}],
             "generationConfig": {"responseMimeType": "application/json", "temperature": 0}}
-    verdict = None
+    verdicts = None
     for model in SAFETY_MODELS:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
         for attempt in range(3):
             try:
-                r = requests.post(url, headers=headers, json=body, timeout=180)
+                r = requests.post(url, headers=headers, json=body, timeout=240)
             except requests.RequestException as e:
-                print(f"  safety network error: {e}")
+                print(f"  check network error: {e}")
                 time.sleep(15)
                 continue
             if r.status_code == 200:
                 try:
                     text = "".join(p.get("text", "") for p in r.json()["candidates"][0]["content"]["parts"])
                     text = text[text.find("{"): text.rfind("}") + 1]
-                    verdict = set(int(x) for x in json.loads(text).get("unsafe", []))
+                    verdicts = {str(k): str(v).lower() for k, v in json.loads(text).get("verdicts", {}).items()}
                 except Exception as e:
-                    print(f"  safety parse error: {e}")
+                    print(f"  check parse error: {e}")
                 break
             if r.status_code in (429, 500, 502, 503, 504):
                 time.sleep(30 * (attempt + 1))
                 continue
-            print(f"  safety {model} HTTP {r.status_code}")
+            print(f"  check {model} HTTP {r.status_code}")
             break
-        if verdict is not None:
-            print(f"Safety check by {model}: {len(verdict)} of {len(flat)} marked unsafe")
+        if verdicts is not None:
+            print(f"Media check by {model}")
             break
 
-    if verdict is None:
-        print("[!] Safety check failed - dropping ALL media for today")
+    if verdicts is None:
+        print("[!] Media check failed - dropping ALL media for today")
         return {seg: [] for seg in media}
 
-    cleaned = {}
+    cleaned, stats = {}, {"ok": 0, "reject": 0, "unsafe": 0}
     for seg, items in media.items():
         keep = []
         for it in items:
-            unsafe = (it["_n"] in verdict) or not it["_ok_preview"]
-            if unsafe:
-                print(f"  removed {it['source']} ({seg})")
-            else:
-                keep.append({k: v for k, v in it.items() if not k.startswith("_")})
-        cleaned[seg] = keep
-    return cleaned
-
-
-def main():
-    if not ENABLED:
-        print("MEDIA_ENABLED is off - skipping")
-        return
-    day_dir = latest_day_dir()
-    script = json.loads((day_dir / "script.json").read_text(encoding="utf-8"))
-    media = asyncio.run(download_all(day_dir, script))
-    if SAFETY:
-        media = safety_filter(day_dir, media)
-    else:
-        print("[!] MEDIA_SAFETY is off - media is NOT checked for graphic content")
-    (day_dir / "media.json").write_text(json.dumps(media, ensure_ascii=False, indent=2), encoding="utf-8")
-    total = sum(len(v) for v in media.values())
-    print(f"Saved {total} media items -> {day_dir / 'media.json'}")
-
-
-if __name__ == "__main__":
-    main()
+            v = verdicts.get(str(it["_n"]), "reject") if it["_has_preview"] else "reject"
+            if v not in stats:
+                v = "reject"
+            stats[v] += 1
+            if v == "ok" and len(keep) < PER_SEGMENT:
+                keep.append({k: val for k, val in it.items() if not k.startswith("_")})
+            elif v !=
