@@ -25,11 +25,16 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ffmpeg fonts-noto-core fonts-dejavu-core
 
+      - name: Install avatar dependencies
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install librosa opencv-python-headless tqdm
+
       - name: Cache models and fonts
         uses: actions/cache@v4
         with:
           path: models
-          key: phonikud-1.0-int8-heebo
+          key: models-v2-heebo-wav2lip
 
       - name: Collect Telegram posts
         env:
@@ -79,6 +84,12 @@ jobs:
           TTS_PAUSE: "0.6"
         run: python tts.py
 
+      - name: Avatar lip-sync (Wav2Lip)
+        env:
+          AVATAR_ENABLED: "1"
+          AVATAR_IMAGE: "presenter.jpg"
+        run: python avatar.py
+
       - name: Render video
         env:
           CHANNEL_NAME: "חדשות היום"
@@ -95,4 +106,9 @@ jobs:
         run: python upload.py
 
       - name: Upload output
-        if:
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: daily-output
+          path: daily/
+          retention-days: 7
