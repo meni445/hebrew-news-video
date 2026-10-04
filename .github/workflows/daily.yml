@@ -2,14 +2,13 @@ name: Daily news video
 
 on:
   workflow_dispatch:
-  # Daily schedule - enable once the upload step works (remove the # on the next 2 lines).
   # GitHub cron is UTC: 01:00 UTC = 04:00 Israel summer time / 03:00 winter time.
-  # schedule:
-  #   - cron: "0 1 * * *"
+  schedule:
+    - cron: "0 1 * * *"
 
 jobs:
   run:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 180
     steps:
       - name: Checkout
