@@ -220,4 +220,29 @@ def check_media(day_dir, script, media):
             stats[v] += 1
             if v == "ok" and len(keep) < PER_SEGMENT:
                 keep.append({k: val for k, val in it.items() if not k.startswith("_")})
-            elif v !=
+            elif v != "ok":
+                print(f"  {v}: {it['source']} ({seg})")
+        cleaned[seg] = keep
+    print(f"Verdicts: {stats}")
+    return cleaned
+
+
+def main():
+    if not ENABLED:
+        print("MEDIA_ENABLED is off - skipping")
+        return
+    day_dir = latest_day_dir()
+    script = json.loads((day_dir / "script.json").read_text(encoding="utf-8"))
+    media = asyncio.run(download_all(day_dir, script))
+    if SAFETY:
+        media = check_media(day_dir, script, media)
+    else:
+        print("[!] MEDIA_SAFETY is off - media is NOT checked")
+        media = {seg: items[:PER_SEGMENT] for seg, items in media.items()}
+    (day_dir / "media.json").write_text(json.dumps(media, ensure_ascii=False, indent=2), encoding="utf-8")
+    total = sum(len(v) for v in media.values())
+    print(f"Saved {total} media items -> {day_dir / 'media.json'}")
+
+
+if __name__ == "__main__":
+    main()
