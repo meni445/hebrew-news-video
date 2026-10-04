@@ -50,7 +50,7 @@ jobs:
           MAX_STORIES: "8"
         run: python script.py
 
-      - name: Download news media (Telegram + safety check)
+      - name: Download news media (Telegram + check)
         env:
           TG_API_ID: ${{ secrets.TG_API_ID }}
           TG_API_HASH: ${{ secrets.TG_API_HASH }}
@@ -58,6 +58,7 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           MEDIA_ENABLED: "1"
           MEDIA_SAFETY: "1"
+          MEDIA_CANDIDATES: "4"
           MEDIA_PER_SEGMENT: "2"
           MEDIA_MAX_MB: "40"
           MEDIA_MAX_VIDEO_SEC: "120"
@@ -94,9 +95,4 @@ jobs:
         run: python upload.py
 
       - name: Upload output
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: daily-output
-          path: daily/
-          retention-days: 7
+        if:
