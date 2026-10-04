@@ -80,7 +80,7 @@ def font(size, bold=True):
 
 
 def rtl(text):
-    return get_display(text)
+        return get_display(text, base_dir="R")
 
 
 def text_w(draw, text, f):
