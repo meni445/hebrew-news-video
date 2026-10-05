@@ -2,6 +2,7 @@ import json
 import os
 import subprocess
 import sys
+import traceback
 from pathlib import Path
 
 import requests
@@ -22,6 +23,10 @@ MODEL_URLS = [u.strip() for u in os.getenv(
 MIN_MODEL_BYTES = 300_000_000
 
 
+class AvatarError(Exception):
+    pass
+
+
 def run(cmd, cwd=None, timeout=3600):
     r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout)
     return r.returncode == 0, (r.stdout + r.stderr)[-2500:]
@@ -39,8 +44,7 @@ def ensure_repo():
         print("Cloning Wav2Lip...")
         ok, log = run(["git", "clone", "--depth", "1", W2L_REPO, str(W2L_DIR)])
         if not ok:
-            print(f"[!] clone failed:\n{log}")
-            return False
+            raise AvatarError(f"clone failed:\n{log}")
     # patch 1: newer librosa needs keyword arguments
     audio_py = W2L_DIR / "audio.py"
     t = audio_py.read_text(encoding="utf-8")
@@ -55,12 +59,11 @@ def ensure_repo():
         inf_py.write_text(t.replace("torch.load(checkpoint_path",
                                     "torch.load(checkpoint_path, weights_only=False"), encoding="utf-8")
     (W2L_DIR / "temp").mkdir(exist_ok=True)
-    return True
 
 
 def ensure_model():
     if MODEL.exists() and MODEL.stat().st_size > MIN_MODEL_BYTES:
-        return True
+        return
     MODEL.parent.mkdir(parents=True, exist_ok=True)
     for url in MODEL_URLS:
         print(f"Downloading Wav2Lip model from {url} ...")
@@ -73,12 +76,12 @@ def ensure_model():
                         f.write(chunk)
             if tmp.stat().st_size > MIN_MODEL_BYTES:
                 tmp.rename(MODEL)
-                return True
+                return
             print(f"  file too small ({tmp.stat().st_size} bytes), trying next")
         except Exception as e:
             print(f"  failed: {e}")
         tmp.unlink(missing_ok=True)
-    return False
+    raise AvatarError("model download failed from all URLs")
 
 
 def face_box(img_path):
@@ -88,7 +91,7 @@ def face_box(img_path):
     cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
     faces = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(80, 80))
     if len(faces) == 0:
-        return None
+        raise AvatarError("no face found in the image")
     x, y, w, h = max(faces, key=lambda f: f[2] * f[3])
     ih, iw = gray.shape
     y1 = max(0, int(y))
@@ -98,13 +101,42 @@ def face_box(img_path):
     return y1, y2, x1, x2
 
 
-def still_fallback(src, out, seconds, reason):
-    print(f"[!] lip-sync failed ({reason}) - using a still image of the presenter")
+def still_video(src, out, seconds):
     ok, log = run(["ffmpeg", "-y", "-loop", "1", "-i", str(src), "-t", f"{seconds:.2f}", "-r", "25",
                    "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p",
                    "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", str(out)])
     if not ok:
-        print(f"[!] still fallback failed too:\n{log}")
+        print(f"[!] still video failed too:\n{log}")
+
+
+def lip_sync(day_dir, src, narration, out):
+    box = face_box(src)
+    print(f"Face box (top, bottom, left, right): {box}")
+
+    wav = day_dir / "avatar_audio.wav"
+    ok, log = run(["ffmpeg", "-y", "-i", str(narration), "-ar", "16000", "-ac", "1", str(wav)])
+    if not ok:
+        raise AvatarError(f"audio conversion failed:\n{log}")
+
+    ensure_repo()
+    ensure_model()
+
+    raw = day_dir / "avatar_raw.mp4"
+    print("Running Wav2Lip (CPU)...")
+    cmd = [sys.executable, "inference.py",
+           "--checkpoint_path", str(MODEL),
+           "--face", str(src.resolve()),
+           "--audio", str(wav.resolve()),
+           "--outfile", str(raw.resolve()),
+           "--box", *[str(v) for v in box]]
+    ok, log = run(cmd, cwd=W2L_DIR, timeout=5400)
+    if not ok or not raw.exists():
+        raise AvatarError(f"Wav2Lip error:\n{log}")
+
+    ok, log = run(["ffmpeg", "-y", "-i", str(raw), "-an", "-c:v", "libx264", "-preset", "veryfast",
+                   "-crf", "20", "-pix_fmt", "yuv420p", str(out)])
+    if not ok:
+        raise AvatarError(f"final encode failed:\n{log}")
 
 
 def main():
@@ -121,7 +153,7 @@ def main():
     total = audio["total_duration"]
     out = day_dir / "avatar.mp4"
 
-    # prepare a smaller copy of the image (even dimensions)
+    # smaller copy of the image with even dimensions
     src = day_dir / "avatar_src.jpg"
     img = Image.open(IMAGE).convert("RGB")
     if img.width > WIDTH:
@@ -129,43 +161,14 @@ def main():
     img = img.crop((0, 0, img.width - img.width % 2, img.height - img.height % 2))
     img.save(src, quality=95)
 
-    box = face_box(src)
-    if not box:
-        return still_fallback(src, out, total, "no face found in the image")
-    print(f"Face box (top, bottom, left, right): {box}")
-
-    wav = day_dir / "avatar_audio.wav"
-    ok, log = run(["ffmpeg", "-y", "-i", str(narration), "-ar", "16000", "-ac", "1", str(wav)])
-    if not ok:
-        return still_fallback(src, out, total, "audio conversion")
-
-    if not ensure_repo():
-        return still_fallback(src, out, total, "Wav2Lip code")
-    if not ensure_model():
-        return still_fallback(src, out, total, "model download")
-
-    raw = day_dir / "avatar_raw.mp4"
-    print("Running Wav2Lip (CPU)...")
-    cmd = [sys.executable, "inference.py",
-           "--checkpoint_path", str(MODEL),
-           "--face", str(src.resolve()),
-           "--audio", str(wav.resolve()),
-           "--outfile", str(raw.resolve()),
-           "--box", *[str(v) for v in box]]
     try:
-        ok, log = run(cmd, cwd=W2L_DIR, timeout=5400)
-    except subprocess.TimeoutExpired:
-        return still_fallback(src, out, total, "timeout")
-    if not ok or not raw.exists():
-        print(log)
-        return still_fallback(src, out, total, "Wav2Lip error, see log above")
-
-    ok, log = run(["ffmpeg", "-y", "-i", str(raw), "-an", "-c:v", "libx264", "-preset", "veryfast",
-                   "-crf", "20", "-pix_fmt", "yuv420p", str(out)])
-    if not ok:
-        print(log)
-        return still_fallback(src, out, total, "final encode")
-    print(f"Saved -> {out}")
+        lip_sync(day_dir, src, narration, out)
+        print(f"Saved -> {out}")
+    except Exception as e:
+        if not isinstance(e, AvatarError):
+            traceback.print_exc()
+        print(f"[!] lip-sync failed ({str(e)[:2000]}) - using a still image of the presenter")
+        still_video(src, out, total)
 
 
 if __name__ == "__main__":
