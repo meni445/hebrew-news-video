@@ -28,6 +28,10 @@ GEMINI_TTS_STYLE = os.getenv(
     "in a deep, warm, calm and authoritative male documentary narrator voice, at a steady pace")
 GEMINI_TTS_GAP = float(os.getenv("GEMINI_TTS_GAP", "25"))      # seconds between requests
 GEMINI_TTS_RETRIES = int(os.getenv("GEMINI_TTS_RETRIES", "4"))
+# Single request: the whole script in one request (like AI Studio), then split into parts
+# at the pauses between stories. Uses 1 request per video instead of one per part.
+# If it fails, falls back to one request per part. Off by default.
+GEMINI_TTS_SINGLE = os.getenv("TTS_SINGLE", "0") == "1"
 
 PAUSE = float(os.getenv("TTS_PAUSE", "0.6"))
 DEEP_EQ = os.getenv("TTS_DEEP_EQ", "0") == "1"
@@ -212,7 +216,7 @@ def short_error(r):
         return r.text[:200]
 
 
-def gemini_synth(text, wav_path, api_key):
+def gemini_synth(text, wav_path, api_key, timeout=300):
     """Returns True on success. Writes a mono 16-bit WAV."""
     headers = {"x-goog-api-key": api_key, "Content-Type": "application/json"}
     body = {
@@ -226,17 +230,21 @@ def gemini_synth(text, wav_path, api_key):
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
         for attempt in range(GEMINI_TTS_RETRIES):
             try:
-                r = requests.post(url, headers=headers, json=body, timeout=300)
+                r = requests.post(url, headers=headers, json=body, timeout=timeout)
             except requests.RequestException as e:
                 print(f"  network error: {e}")
                 time.sleep(20)
                 continue
             if r.status_code == 200:
                 try:
-                    parts = r.json()["candidates"][0]["content"]["parts"]
+                    cand = r.json()["candidates"][0]
+                    parts = cand["content"]["parts"]
                     inline = next(p["inlineData"] for p in parts if "inlineData" in p)
                 except (KeyError, IndexError, StopIteration):
                     print(f"  {model}: no audio in response")
+                    break
+                if cand.get("finishReason") == "MAX_TOKENS":
+                    print(f"  {model}: audio was cut off (too long) -> next model")
                     break
                 pcm = base64.b64decode(inline["data"])
                 if pcm[:4] == b"RIFF":                      # WAV container, not raw PCM
@@ -252,6 +260,7 @@ def gemini_synth(text, wav_path, api_key):
                     w.setsampwidth(2)
                     w.setframerate(rate)
                     w.writeframes(pcm)
+                print(f"  ok ({model})")
                 return True
             if r.status_code in (429, 500, 502, 503, 504):
                 wait = 30 * (attempt + 1)
@@ -261,6 +270,73 @@ def gemini_synth(text, wav_path, api_key):
             print(f"  {model} HTTP {r.status_code}: {short_error(r)} -> next model")
             break
     return False
+
+
+# ---------------- single request: split at the pauses ----------------
+
+def find_pauses(data, sr, min_len=0.25):
+    """Silent stretches as (start_sec, end_sec)."""
+    import numpy as np
+    flen = max(1, int(sr * 0.01))
+    nf = len(data) // flen
+    x = data[:nf * flen].reshape(nf, flen)
+    db = 20 * np.log10(np.sqrt((x ** 2).mean(axis=1)) / 32768 + 1e-9)
+    quiet = db < np.percentile(db, 95) - 35
+    pauses, start = [], None
+    for i, q in enumerate(quiet):
+        if q and start is None:
+            start = i
+        elif not q and start is not None:
+            if (i - start) * 0.01 >= min_len:
+                pauses.append((start * 0.01, i * 0.01))
+            start = None
+    return pauses
+
+
+def split_single(wav_path, parts, audio_dir):
+    """Cut one long narration into the parts. Returns {part_id: wav} or None."""
+    import numpy as np
+    with wave.open(str(wav_path), "rb") as w:
+        sr = w.getframerate()
+        data = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16).astype(np.float32)
+    dur = len(data) / sr
+    words = [max(1, len(p["spoken_text"].split())) for p in parts]
+    total_words = sum(words)
+    if dur < total_words / 4.0:                       # far too short = audio was cut off
+        print(f"  [!] narration is only {dur:.0f}s for {total_words} words - looks cut off")
+        return None
+    pauses = find_pauses(data, sr)
+    avg = dur / len(parts)
+    cuts, prev, acc = [], 0.0, 0
+    for k in range(len(parts) - 1):
+        acc += words[k]
+        expected = dur * acc / total_words
+        best, best_score = None, None
+        for a, b in pauses:
+            mid = (a + b) / 2
+            if mid <= prev + 1.0 or mid >= dur - 1.0 or abs(mid - expected) > 0.6 * avg:
+                continue
+            score = (b - a) - abs(mid - expected) / avg   # long pause near the expected spot
+            if best_score is None or score > best_score:
+                best, best_score = mid, score
+        if best is None:
+            print(f"  [!] no pause found between {parts[k]['id']} and {parts[k + 1]['id']}")
+            return None
+        cuts.append(best)
+        prev = best
+    bounds = [0.0] + cuts + [dur]
+    out = {}
+    for k, p in enumerate(parts):
+        a, b = int(bounds[k] * sr), int(bounds[k + 1] * sr)
+        path = audio_dir / f"{p['id']}_gemini.wav"
+        with wave.open(str(path), "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(sr)
+            w.writeframes(data[a:b].astype(np.int16).tobytes())
+        out[p["id"]] = path
+    print("  split points: " + ", ".join(f"{c:.1f}s" for c in cuts))
+    return out
 
 
 # ---------------- cleanup ----------------
@@ -332,16 +408,33 @@ async def main():
         else:
             style_info = f"style '{GEMINI_TTS_STYLE}'" if GEMINI_TTS_STYLE.strip() else "no style instruction"
             print(f"Engine: Gemini TTS, voice {GEMINI_TTS_VOICE}, {style_info}, models {GEMINI_TTS_MODELS}")
-            ok = True
-            for i, p in enumerate(parts):
-                if i > 0:
+            ok = False
+            if GEMINI_TTS_SINGLE and len(parts) > 1:
+                whole = audio_dir / "whole_gemini.wav"
+                text = "\n\n".join(p["spoken_text"] for p in parts)
+                print(f"Single request: whole script ({len(text.split())} words)...")
+                if gemini_synth(text, whole, api_key, timeout=900):
+                    try:
+                        split = split_single(whole, parts, audio_dir)
+                    except Exception as e:
+                        print(f"  [!] split failed: {e}")
+                        split = None
+                    if split:
+                        sources, ok = split, True
+                if not ok:
+                    print("[!] Single request did not work - using one request per part")
                     time.sleep(GEMINI_TTS_GAP)
-                src = audio_dir / f"{p['id']}_gemini.wav"
-                print(f"Speaking {p['id']} ({len(p['spoken_text'].split())} words)...")
-                if not gemini_synth(p["spoken_text"], src, api_key):
-                    ok = False
-                    break
-                sources[p["id"]] = src
+            if not ok:
+                ok = True
+                for i, p in enumerate(parts):
+                    if i > 0:
+                        time.sleep(GEMINI_TTS_GAP)
+                    src = audio_dir / f"{p['id']}_gemini.wav"
+                    print(f"Speaking {p['id']} ({len(p['spoken_text'].split())} words)...")
+                    if not gemini_synth(p["spoken_text"], src, api_key):
+                        ok = False
+                        break
+                    sources[p["id"]] = src
             if ok:
                 used = "gemini"
             else:
