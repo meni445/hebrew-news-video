@@ -193,3 +193,191 @@ def make_overlay(path, kind, text_left, title="", index=0, total=0):
         draw_lines(d, ["תודה שצפיתם"], font(72), H - 260, WHITE)
         draw_lines(d, ["הירשמו לערוץ לעדכונים יומיים"], font(44, bold=False), H - 160, GREY)
     img.save(path)
+
+# ---------------- media track (full frame) ----------------
+
+FILL_GRAPH = (f"[0:v]split=2[a][b];"
+              f"[a]scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},"
+              f"boxblur=30:3,eq=brightness=-0.15[bg];"
+              f"[b]scale={W}:{H}:force_original_aspect_ratio=decrease[fg];"
+              f"[bg][fg]overlay=(W-w)/2:(H-h)/2,setsar=1,fps={FPS},format=yuv420p[v]")
+
+
+def enc_args():
+    return ["-an", "-c:v", "libx264", "-preset", PRESET, "-crf", "21", "-r", str(FPS)]
+
+
+def media_clip(src, kind, frames, out):
+    inp = ["-loop", "1", "-framerate", str(FPS), "-i", str(src)] if kind == "photo" \
+        else ["-stream_loop", "-1", "-i", str(src)]
+    return run_ok(["ffmpeg", "-y", *inp, "-filter_complex", FILL_GRAPH, "-map", "[v]",
+                   "-frames:v", str(frames), *enc_args(), str(out)])
+
+
+def card_clip(card, frames, out):
+    return run_ok(["ffmpeg", "-y", "-loop", "1", "-framerate", str(FPS), "-i", str(card),
+                   "-vf", f"setsar=1,fps={FPS},format=yuv420p",
+                   "-frames:v", str(frames), *enc_args(), str(out)])
+
+
+def build_track(day_dir, parts, total, media, card):
+    track_dir = day_dir / "track"
+    track_dir.mkdir(exist_ok=True)
+    clips, used = [], 0
+    for i, p in enumerate(parts):
+        start = p["start"]
+        end = parts[i + 1]["start"] if i + 1 < len(parts) else total
+        frames = max(1, round(end * FPS) - round(start * FPS))
+        items = [it for it in media.get(p["id"], []) if (day_dir / it["file"]).exists()]
+        if items:
+            base, extra = divmod(frames, len(items))
+            for k, it in enumerate(items):
+                n = base + (1 if k < extra else 0)
+                if n <= 0:
+                    continue
+                out = track_dir / f"{p['id']}_{k}.mp4"
+                ok = media_clip(day_dir / it["file"], it["type"], n, out)
+                if ok:
+                    used += 1
+                else:
+                    ok = card_clip(card, n, out)
+                if not ok:
+                    sys.exit("Could not build media track")
+                clips.append(out)
+        else:
+            out = track_dir / f"{p['id']}_card.mp4"
+            if not card_clip(card, frames, out):
+                sys.exit("Could not build media track")
+            clips.append(out)
+
+    list_file = track_dir / "concat.txt"
+    list_file.write_text("".join(f"file '{c.name}'\n" for c in clips), encoding="utf-8")
+    track = track_dir / "track.mp4"
+    if not run_ok(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(list_file),
+                   "-c", "copy", str(track)]):
+        sys.exit("Could not join media track")
+    print(f"Media track: {used} media items, {len(clips)} clips")
+    return track
+
+
+def latest_day_dir():
+    days = sorted(p for p in Path("daily").glob("*") if (p / "audio.json").exists())
+    if not days:
+        sys.exit("No daily/*/audio.json found - run tts.py first")
+    return days[-1]
+
+
+def main():
+    day_dir = latest_day_dir()
+    script = json.loads((day_dir / "script.json").read_text(encoding="utf-8"))
+    audio = json.loads((day_dir / "audio.json").read_text(encoding="utf-8"))
+    media_file = day_dir / "media.json"
+    media = json.loads(media_file.read_text(encoding="utf-8")) if media_file.exists() else {}
+    parts = audio["parts"]
+    total = audio["total_duration"]
+    narration = day_dir / audio["narration"]
+
+    # presenter source: lip-synced avatar for today > looping presenter clip > none
+    avatar = day_dir / "avatar.mp4"
+    if avatar.exists():
+        pip_src, pip_loop = avatar, False
+    elif PRESENTER.exists():
+        pip_src, pip_loop = PRESENTER, True
+    else:
+        pip_src, pip_loop = None, False
+    has_pip = pip_src is not None
+    text_left = (PIP_X + PIP_W + 60) if has_pip else MARGIN
+
+    frames_dir = day_dir / "frames"
+    frames_dir.mkdir(exist_ok=True)
+
+    print(f"Font: {FONT_BOLD} ({'variable' if FONT_VARIABLE else 'static'})")
+    date_text = f"יום {script.get('weekday', '')}, {script.get('date', '')}".strip(", ")
+
+    card = frames_dir / "card.png"
+    make_card(card)
+    chrome = frames_dir / "chrome.png"
+    make_chrome(chrome, date_text, has_pip, text_left)
+
+    seg_parts = [p for p in parts if p["id"].startswith("seg")]
+    overlays = []
+    for i, p in enumerate(parts):
+        png = frames_dir / f"{p['id']}.png"
+        if p["id"] == "intro":
+            make_overlay(png, "intro", text_left, title=script.get("title", ""))
+        elif p["id"] == "outro":
+            make_overlay(png, "outro", text_left)
+        else:
+            make_overlay(png, "segment", text_left, title=p.get("headline", ""),
+                         index=seg_parts.index(p) + 1, total=len(seg_parts))
+        start = p["start"]
+        end = parts[i + 1]["start"] if i + 1 < len(parts) else total
+        overlays.append((png, start, end))
+
+    track = build_track(day_dir, parts, total, media, card)
+
+    # thumbnail: first story photo full-frame (or card) + chrome + intro text
+    base = Image.open(card).convert("RGB")
+    for seg in sorted(media):
+        photos = [it for it in media[seg] if it["type"] == "photo" and (day_dir / it["file"]).exists()]
+        if photos:
+            try:
+                base = ImageOps.fit(Image.open(day_dir / photos[0]["file"]).convert("RGB"), (W, H))
+            except Exception:
+                pass
+            break
+    thumb = base.convert("RGBA")
+    thumb_chrome = frames_dir / "chrome_thumb.png"
+    make_chrome(thumb_chrome, date_text, False, MARGIN)
+    thumb.alpha_composite(Image.open(thumb_chrome))
+    thumb_title = frames_dir / "intro_thumb.png"
+    make_overlay(thumb_title, "intro", MARGIN, title=script.get("title", ""))
+    thumb.alpha_composite(Image.open(thumb_title))
+    thumb.convert("RGB").save(day_dir / "thumbnail.png")
+
+    cmd = ["ffmpeg", "-y", "-i", str(track),
+           "-loop", "1", "-framerate", str(FPS), "-i", str(chrome)]
+    n = 2
+    if has_pip:
+        cmd += (["-stream_loop", "-1"] if pip_loop else []) + ["-i", str(pip_src)]
+        pip_idx = n
+        n += 1
+    first_overlay = n
+    for png, _, _ in overlays:
+        cmd += ["-loop", "1", "-framerate", str(FPS), "-i", str(png)]
+        n += 1
+    cmd += ["-i", str(narration)]
+    audio_idx = n
+
+    filters = [f"[0:v][1:v]overlay=0:0[c0]"]
+    cur = "[c0]"
+    if has_pip:
+        filters.append(f"[{pip_idx}:v]scale={PIP_W}:{PIP_H}:force_original_aspect_ratio=increase,"
+                       f"crop={PIP_W}:{PIP_H},setsar=1,fps={FPS}[pip]")
+        filters.append(f"{cur}[pip]overlay={PIP_X}:{PIP_Y}:eof_action=repeat[c1]")
+        cur = "[c1]"
+    for k, (_, start, end) in enumerate(overlays):
+        out = f"[o{k}]"
+        filters.append(f"{cur}[{first_overlay + k}:v]overlay=0:0:"
+                       f"enable='between(t,{start:.3f},{end:.3f})'{out}")
+        cur = out
+
+    out_file = day_dir / "video.mp4"
+    cmd += ["-filter_complex", ";".join(filters), "-map", cur, "-map", f"{audio_idx}:a",
+            "-t", f"{total:.3f}", "-r", str(FPS),
+            "-c:v", "libx264", "-preset", PRESET, "-crf", CRF, "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", str(out_file)]
+
+    print(f"Presenter: {pip_src if has_pip else 'none (box hidden)'}")
+    print(f"Rendering {total / 60:.1f} min video with {len(overlays)} overlays...")
+    r = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    if r.returncode != 0:
+        sys.exit(f"ffmpeg failed:\n{r.stderr[-2000:]}")
+
+    size_mb = out_file.stat().st_size / 1e6
+    print(f"Saved -> {out_file} ({size_mb:.0f} MB)")
+    print(f"Saved -> {day_dir / 'thumbnail.png'}")
+
+
+if __name__ == "__main__":
+    main()
