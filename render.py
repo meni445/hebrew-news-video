@@ -1,12 +1,13 @@
 import json
 import os
+import re
 import subprocess
 import sys
 from glob import glob
 from pathlib import Path
 
 import requests
-from PIL import Image, ImageDraw, ImageFont, ImageOps
+from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageOps
 
 try:
     from bidi.algorithm import get_display
@@ -24,6 +25,12 @@ FONT_URL = os.getenv(
     "FONT_URL",
     "https://raw.githubusercontent.com/google/fonts/main/ofl/heebo/Heebo%5Bwght%5D.ttf")
 FONT_PATH = Path(os.getenv("FONT_PATH", "models/fonts/Heebo.ttf"))
+# Channel background image for parts without media ("" = plain gradient card)
+BG_IMAGE = Path(os.getenv("BG_IMAGE", "")) if os.getenv("BG_IMAGE", "").strip() else None
+# Stories without media show their text on screen instead of the plain card. Off by default.
+TEXT_CARDS = os.getenv("TEXT_CARDS", "0") == "1"
+TEXT_SIZE = int(os.getenv("TEXT_CARD_SIZE", "52"))
+TEXT_LINES = int(os.getenv("TEXT_CARD_LINES", "5"))
 
 BG_TOP = (14, 22, 40)
 BG_BOTTOM = (28, 44, 78)
@@ -135,8 +142,25 @@ def run_ok(cmd):
 
 # ---------------- graphics ----------------
 
+def load_bg():
+    if BG_IMAGE is None:
+        return None
+    if not BG_IMAGE.exists():
+        print(f"[!] background image {BG_IMAGE} not found, using the plain card")
+        return None
+    try:
+        return ImageOps.fit(Image.open(BG_IMAGE).convert("RGB"), (W, H))
+    except Exception as e:
+        print(f"[!] background image unreadable ({e}), using the plain card")
+        return None
+
+
 def make_card(path):
     """Full-frame branded card for parts without media."""
+    bg = load_bg()
+    if bg is not None:
+        ImageEnhance.Brightness(bg).enhance(0.85).save(path)
+        return
     img = Image.new("RGB", (W, H))
     d = ImageDraw.Draw(img)
     for y in range(H):
@@ -148,6 +172,78 @@ def make_card(path):
     d.text(((W - w) / 2, 330), rtl(CHANNEL_NAME), font=f, fill=WHITE)
     d.rectangle([W / 2 - 160, 500, W / 2 + 160, 510], fill=ACCENT)
     img.save(path)
+
+
+def make_text_base(path):
+    """Blurred, darkened background for the text cards."""
+    bg = load_bg()
+    if bg is None:
+        bg = Image.new("RGB", (W, H))
+        d = ImageDraw.Draw(bg)
+        for y in range(H):
+            t = y / H
+            d.line([(0, y), (W, y)],
+                   fill=tuple(int(BG_TOP[i] + (BG_BOTTOM[i] - BG_TOP[i]) * t) for i in range(3)))
+    else:
+        bg = ImageEnhance.Brightness(bg.filter(ImageFilter.GaussianBlur(18))).enhance(0.45)
+    bg.save(path)
+
+
+# text panel between the top badge and the lower third
+PANEL_TOP, PANEL_BOTTOM = 215, H - 320
+PANEL_PAD = 45
+
+
+def text_pages(draw, text, max_w):
+    """Split a story into pages of up to TEXT_LINES lines, keeping whole sentences when possible."""
+    f = font(TEXT_SIZE)
+    pieces = []
+    for sent in re.split(r"(?<=[.!?])\s+", text.strip()):
+        if not sent:
+            continue
+        if len(wrap(draw, sent, f, max_w)) <= TEXT_LINES:
+            pieces.append(sent)
+            continue
+        cur = ""                                   # very long sentence: split by words
+        for word in sent.split():
+            test = f"{cur} {word}".strip()
+            if len(wrap(draw, test, f, max_w)) <= TEXT_LINES or not cur:
+                cur = test
+            else:
+                pieces.append(cur)
+                cur = word
+        if cur:
+            pieces.append(cur)
+    pages, cur = [], ""
+    for piece in pieces:
+        test = f"{cur} {piece}".strip()
+        if len(wrap(draw, test, f, max_w)) <= TEXT_LINES or not cur:
+            cur = test
+        else:
+            pages.append(cur)
+            cur = piece
+    if cur:
+        pages.append(cur)
+    return pages
+
+
+def make_text_card(path, base, text, panel_left):
+    img = Image.open(base).convert("RGBA")
+    layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    d = ImageDraw.Draw(layer)
+    d.rounded_rectangle([panel_left, PANEL_TOP, TEXT_RIGHT, PANEL_BOTTOM], radius=24,
+                        fill=(8, 14, 30, 185))
+    d.rectangle([TEXT_RIGHT - 10, PANEL_TOP + 24, TEXT_RIGHT, PANEL_BOTTOM - 24], fill=ACCENT)
+    f = font(TEXT_SIZE)
+    max_w = TEXT_RIGHT - panel_left - 2 * PANEL_PAD - 10
+    lines = wrap(d, text, f, max_w)[:TEXT_LINES]
+    step = int(f.size * 1.4)
+    y = PANEL_TOP + (PANEL_BOTTOM - PANEL_TOP - step * len(lines)) // 2
+    for line in lines:
+        draw_rtl(d, line, f, TEXT_RIGHT - PANEL_PAD - 10, y, WHITE)
+        y += step
+    img.alpha_composite(layer)
+    img.convert("RGB").save(path)
 
 
 def make_chrome(path, date_text, has_pip, text_left):
@@ -220,7 +316,33 @@ def card_clip(card, frames, out):
                    "-frames:v", str(frames), *enc_args(), str(out)])
 
 
-def build_track(day_dir, parts, total, media, card):
+def text_clips(day_dir, p, frames, text_card, card):
+    """One clip per text page; page time follows its share of the story's text."""
+    base, panel_left = text_card
+    frames_dir = day_dir / "frames"
+    track_dir = day_dir / "track"
+    probe = ImageDraw.Draw(Image.new("RGB", (10, 10)))
+    max_w = TEXT_RIGHT - panel_left - 2 * PANEL_PAD - 10
+    pages = text_pages(probe, p["text"], max_w) or [p["text"]]
+    weights = [max(1, len(t)) for t in pages]
+    total_w = sum(weights)
+    clips, given = [], 0
+    for k, (page, wgt) in enumerate(zip(pages, weights)):
+        n = frames - given if k == len(pages) - 1 else round(frames * wgt / total_w)
+        if n <= 0:
+            continue
+        given += n
+        png = frames_dir / f"{p['id']}_text{k}.png"
+        out = track_dir / f"{p['id']}_text{k}.mp4"
+        make_text_card(png, base, page, panel_left)
+        if not card_clip(png, n, out) and not card_clip(card, n, out):
+            sys.exit("Could not build media track")
+        clips.append(out)
+    print(f"  {p['id']}: no media -> {len(clips)} text page(s)")
+    return clips
+
+
+def build_track(day_dir, parts, total, media, card, text_card=None):
     track_dir = day_dir / "track"
     track_dir.mkdir(exist_ok=True)
     clips, used = [], 0
@@ -244,6 +366,8 @@ def build_track(day_dir, parts, total, media, card):
                 if not ok:
                     sys.exit("Could not build media track")
                 clips.append(out)
+        elif text_card and p["id"].startswith("seg") and p.get("text", "").strip():
+            clips += text_clips(day_dir, p, frames, text_card, card)
         else:
             out = track_dir / f"{p['id']}_card.mp4"
             if not card_clip(card, frames, out):
@@ -314,7 +438,15 @@ def main():
         end = parts[i + 1]["start"] if i + 1 < len(parts) else total
         overlays.append((png, start, end))
 
-    track = build_track(day_dir, parts, total, media, card)
+    text_card = None
+    if TEXT_CARDS:
+        text_base = frames_dir / "text_base.png"
+        make_text_base(text_base)
+        text_card = (text_base, text_left)
+    print(f"Background: {BG_IMAGE if load_bg() is not None else 'plain card'}, "
+          f"text cards {'on' if TEXT_CARDS else 'off'}")
+
+    track = build_track(day_dir, parts, total, media, card, text_card)
 
     # thumbnail: first story photo full-frame (or card) + chrome + intro text
     base = Image.open(card).convert("RGB")
