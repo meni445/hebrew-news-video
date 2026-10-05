@@ -39,6 +39,14 @@ NIQQUD_MODEL_URL = os.getenv(
 NIQQUD_MODEL_PATH = Path(os.getenv("NIQQUD_MODEL_PATH", "models/phonikud-1.0.int8.onnx"))
 SR = 24000
 
+# Noise trim per part: cuts noise/static before the first and after the last spoken
+# sound, then fades in/out so parts join without clicks. Off by default.
+CLEAN = os.getenv("TTS_CLEAN", "0") == "1"
+CLEAN_KEEP_MS = int(os.getenv("TTS_CLEAN_KEEP_MS", "150"))    # kept around speech
+CLEAN_FADE_MS = int(os.getenv("TTS_CLEAN_FADE_MS", "60"))
+CLEAN_RANGE_DB = float(os.getenv("TTS_CLEAN_RANGE_DB", "30"))  # speech = within this of the loud level
+CLEAN_MAX_ZCR = float(os.getenv("TTS_CLEAN_MAX_ZCR", "0.25"))  # static/hiss has a high zero-crossing rate
+
 HEB_MONTHS = ["ינואר", "פברואר", "מרץ", "אפריל", "מאי", "יוני",
               "יולי", "אוגוסט", "ספטמבר", "אוקטובר", "נובמבר", "דצמבר"]
 DATE_RE = re.compile(r"\b(\d{1,2})\.(\d{1,2})\.(\d{4})\b")
@@ -231,6 +239,12 @@ def gemini_synth(text, wav_path, api_key):
                     print(f"  {model}: no audio in response")
                     break
                 pcm = base64.b64decode(inline["data"])
+                if pcm[:4] == b"RIFF":                      # WAV container, not raw PCM
+                    k = pcm.find(b"data")
+                    if k != -1:
+                        pcm = pcm[k + 8:]
+                if len(pcm) % 2:
+                    pcm = pcm[:-1]
                 m = re.search(r"rate=(\d+)", inline.get("mimeType", ""))
                 rate = int(m.group(1)) if m else 24000
                 with wave.open(str(wav_path), "wb") as w:
@@ -247,6 +261,43 @@ def gemini_synth(text, wav_path, api_key):
             print(f"  {model} HTTP {r.status_code}: {short_error(r)} -> next model")
             break
     return False
+
+
+# ---------------- cleanup ----------------
+
+def clean_edges(path):
+    """Trim non-speech noise at both ends of a mono 16-bit WAV and fade the edges."""
+    import numpy as np
+    with wave.open(str(path), "rb") as w:
+        sr = w.getframerate()
+        data = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16).astype(np.float32)
+    flen = max(1, int(sr * 0.02))
+    nf = len(data) // flen
+    if nf < 10:
+        return None
+    x = data[:nf * flen].reshape(nf, flen)
+    db = 20 * np.log10(np.sqrt((x ** 2).mean(axis=1)) / 32768 + 1e-9)
+    zcr = (np.diff(np.signbit(x), axis=1) != 0).mean(axis=1)
+    loud = np.percentile(db, 95)
+    speech = np.where((db > loud - CLEAN_RANGE_DB) & (zcr < CLEAN_MAX_ZCR))[0]
+    if len(speech) == 0:
+        return None
+    keep = CLEAN_KEEP_MS // 20
+    s = max(0, int(speech[0]) - keep)
+    e = min(nf, int(speech[-1]) + 1 + keep)
+    end = len(data) if e == nf else e * flen
+    out = data[s * flen:end].copy()
+    fade = min(len(out) // 4, int(sr * CLEAN_FADE_MS / 1000))
+    if fade > 0:
+        ramp = np.linspace(0.0, 1.0, fade, dtype=np.float32)
+        out[:fade] *= ramp
+        out[-fade:] *= ramp[::-1]
+    with wave.open(str(path), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(sr)
+        w.writeframes(np.clip(out, -32768, 32767).astype(np.int16).tobytes())
+    return s * flen / sr, (len(data) - end) / sr
 
 
 # ---------------- main ----------------
@@ -308,13 +359,22 @@ async def main():
 
     silence = audio_dir / "silence.wav"
     run(["ffmpeg", "-y", "-f", "lavfi", "-i", f"anullsrc=r={SR}:cl=mono",
-         "-t", str(PAUSE), str(silence)])
+         "-t", str(PAUSE), "-c:a", "pcm_s16le", str(silence)])
+    print(f"Noise trim at part edges: {'on' if CLEAN else 'off'}")
 
     t = 0.0
     concat_lines = []
     for idx, p in enumerate(parts):
         wav = audio_dir / f"{p['id']}.wav"
-        run(["ffmpeg", "-y", "-i", str(sources[p["id"]]), "-ar", str(SR), "-ac", "1", str(wav)])
+        run(["ffmpeg", "-y", "-i", str(sources[p["id"]]), "-ar", str(SR), "-ac", "1",
+             "-c:a", "pcm_s16le", str(wav)])
+        if CLEAN:
+            try:
+                cut = clean_edges(wav)
+                if cut:
+                    print(f"  {p['id']}: trimmed {cut[0]:.2f}s at start, {cut[1]:.2f}s at end")
+            except Exception as e:
+                print(f"  [!] cleanup failed for {p['id']} ({e}), keeping it as is")
         dur = duration(wav)
         srt = audio_dir / f"{p['id']}.srt"
         p.update({"audio": f"audio/{wav.name}",
@@ -342,7 +402,7 @@ async def main():
 
     manifest = {"engine": used,
                 "voice": GEMINI_TTS_VOICE if used == "gemini" else VOICE,
-                "deep_eq": DEEP_EQ, "niqqud": NIQQUD, "pause": PAUSE,
+                "deep_eq": DEEP_EQ, "niqqud": NIQQUD, "pause": PAUSE, "clean": CLEAN,
                 "total_duration": round(duration(narration), 3),
                 "narration": "audio/narration.mp3", "parts": parts}
     (day_dir / "audio.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2),
