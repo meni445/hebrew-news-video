@@ -53,7 +53,7 @@ jobs:
           GEMINI_MODEL: "gemini-3.8-flash,gemini-flash-latest,gemini-flash-lite-latest"
           GEMINI_RETRIES: "6"
           GEMINI_WAIT: "60"
-          PROOFREAD: "1"
+          PROOFREAD: "2"
           TARGET_MINUTES: "5"
           MAX_STORIES: "8"
         run: python script.py
