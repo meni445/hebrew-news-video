@@ -1,21 +1,38 @@
 import asyncio
+import base64
 import json
 import os
 import re
 import subprocess
 import sys
+import time
+import wave
 from pathlib import Path
 
 import edge_tts
 import requests
 
-VOICE = os.getenv("TTS_VOICE", "he-IL-AvriNeural")   # or he-IL-HilaNeural (female)
-RATE = os.getenv("TTS_RATE", "+0%")                    # e.g. "+5%" faster, "-5%" slower
-PITCH = os.getenv("TTS_PITCH", "+0Hz")                 # e.g. "-8Hz" for a deeper voice
-PAUSE = float(os.getenv("TTS_PAUSE", "0.6"))           # seconds of silence between parts
-DEEP_EQ = os.getenv("TTS_DEEP_EQ", "0") == "1"         # bass warmth + compression + loudness (off by default)
+ENGINE = os.getenv("TTS_ENGINE", "edge")              # "edge" or "gemini" (gemini falls back to edge)
+
+# Edge settings (also used as fallback)
+VOICE = os.getenv("TTS_VOICE", "he-IL-AvriNeural")
+RATE = os.getenv("TTS_RATE", "+0%")
+PITCH = os.getenv("TTS_PITCH", "+0Hz")
+
+# Gemini TTS settings
+GEMINI_TTS_MODELS = [m.strip() for m in os.getenv("GEMINI_TTS_MODEL", "").split(",") if m.strip()]
+GEMINI_TTS_VOICE = os.getenv("GEMINI_TTS_VOICE", "Charon")
+GEMINI_TTS_STYLE = os.getenv(
+    "GEMINI_TTS_STYLE",
+    "Read the following Hebrew news text aloud in Hebrew, exactly as written, "
+    "in a deep, warm, calm and authoritative male documentary narrator voice, at a steady pace")
+GEMINI_TTS_GAP = float(os.getenv("GEMINI_TTS_GAP", "25"))      # seconds between requests
+GEMINI_TTS_RETRIES = int(os.getenv("GEMINI_TTS_RETRIES", "4"))
+
+PAUSE = float(os.getenv("TTS_PAUSE", "0.6"))
+DEEP_EQ = os.getenv("TTS_DEEP_EQ", "0") == "1"
 PRON_FILE = os.getenv("TTS_PRONUNCIATIONS", "pronunciations.txt")
-NIQQUD = os.getenv("TTS_NIQQUD", "0") == "1"           # automatic niqqud before speaking (off by default)
+NIQQUD = os.getenv("TTS_NIQQUD", "0") == "1"
 NIQQUD_MODEL_URL = os.getenv(
     "NIQQUD_MODEL_URL",
     "https://huggingface.co/thewh1teagle/phonikud-onnx/resolve/main/phonikud-1.0.int8.onnx")
@@ -26,13 +43,11 @@ HEB_MONTHS = ["ינואר", "פברואר", "מרץ", "אפריל", "מאי", "�
               "יולי", "אוגוסט", "ספטמבר", "אוקטובר", "נובמבר", "דצמבר"]
 DATE_RE = re.compile(r"\b(\d{1,2})\.(\d{1,2})\.(\d{4})\b")
 
-# warm low end, gentle compression, YouTube loudness (-14 LUFS)
 EQ_FILTER = ("equalizer=f=110:t=q:w=1.0:g=3,"
              "equalizer=f=3500:t=q:w=1.0:g=1.5,"
              "acompressor=threshold=-20dB:ratio=3:attack=5:release=120,"
              "loudnorm=I=-14:TP=-1.5:LRA=9")
 
-# standard niqqud + dagesh + shin/sin dots + qamats qatan + maqaf + sof pasuq
 KEEP_MARKS = set(range(0x05B0, 0x05BD)) | {0x05BE, 0x05C1, 0x05C2, 0x05C3, 0x05C7}
 
 
@@ -49,13 +64,13 @@ def load_pronunciations(path):
         src, dst = src.strip(), dst.strip()
         if src and dst:
             pairs.append((src, dst))
-    pairs.sort(key=lambda x: len(x[0]), reverse=True)   # longest first
+    pairs.sort(key=lambda x: len(x[0]), reverse=True)
     return pairs
 
 
 PRONUNCIATIONS = load_pronunciations(PRON_FILE)
 
-_nakdan = None  # None = not loaded yet, False = unavailable
+_nakdan = None
 
 
 def get_nakdan():
@@ -82,7 +97,6 @@ def get_nakdan():
 
 
 def clean_marks(text):
-    """Keep standard niqqud only; drop Phonikud's extra stress/shva/prefix markers."""
     out = []
     for ch in text:
         cp = ord(ch)
@@ -98,9 +112,8 @@ def diacritize(text):
     nak = get_nakdan()
     if not nak:
         return text
-    sentences = re.split(r"(?<=[.!?])\s+", text)
     out = []
-    for s in sentences:
+    for s in re.split(r"(?<=[.!?])\s+", text):
         if not s.strip():
             continue
         try:
@@ -112,7 +125,6 @@ def diacritize(text):
 
 
 def speakable(text):
-    """Dates as words -> protect dictionary words -> niqqud -> restore dictionary words."""
     def repl(m):
         d, mo, y = int(m.group(1)), int(m.group(2)), m.group(3)
         if 1 <= mo <= 12 and 1 <= d <= 31:
@@ -156,7 +168,9 @@ def latest_day_dir():
     return days[-1]
 
 
-async def synth(text, mp3_path, srt_path):
+# ---------------- Edge TTS ----------------
+
+async def edge_synth(text, mp3_path, srt_path):
     for attempt in range(4):
         try:
             comm = edge_tts.Communicate(text, VOICE, rate=RATE, pitch=PITCH)
@@ -176,10 +190,66 @@ async def synth(text, mp3_path, srt_path):
             return
         except Exception as e:
             wait = 10 * (attempt + 1)
-            print(f"  TTS error: {e} -> retry in {wait}s")
+            print(f"  Edge TTS error: {e} -> retry in {wait}s")
             await asyncio.sleep(wait)
-    sys.exit(f"TTS failed for {mp3_path.name}")
+    sys.exit(f"Edge TTS failed for {mp3_path.name}")
 
+
+# ---------------- Gemini TTS ----------------
+
+def short_error(r):
+    try:
+        return r.json()["error"]["message"][:200]
+    except Exception:
+        return r.text[:200]
+
+
+def gemini_synth(text, wav_path, api_key):
+    """Returns True on success. Writes a mono 16-bit WAV."""
+    headers = {"x-goog-api-key": api_key, "Content-Type": "application/json"}
+    body = {
+        "contents": [{"parts": [{"text": f"{GEMINI_TTS_STYLE}:\n\n{text}" if GEMINI_TTS_STYLE.strip() else text}]}],
+        "generationConfig": {
+            "responseModalities": ["AUDIO"],
+            "speechConfig": {"voiceConfig": {"prebuiltVoiceConfig": {"voiceName": GEMINI_TTS_VOICE}}},
+        },
+    }
+    for model in GEMINI_TTS_MODELS:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+        for attempt in range(GEMINI_TTS_RETRIES):
+            try:
+                r = requests.post(url, headers=headers, json=body, timeout=300)
+            except requests.RequestException as e:
+                print(f"  network error: {e}")
+                time.sleep(20)
+                continue
+            if r.status_code == 200:
+                try:
+                    parts = r.json()["candidates"][0]["content"]["parts"]
+                    inline = next(p["inlineData"] for p in parts if "inlineData" in p)
+                except (KeyError, IndexError, StopIteration):
+                    print(f"  {model}: no audio in response")
+                    break
+                pcm = base64.b64decode(inline["data"])
+                m = re.search(r"rate=(\d+)", inline.get("mimeType", ""))
+                rate = int(m.group(1)) if m else 24000
+                with wave.open(str(wav_path), "wb") as w:
+                    w.setnchannels(1)
+                    w.setsampwidth(2)
+                    w.setframerate(rate)
+                    w.writeframes(pcm)
+                return True
+            if r.status_code in (429, 500, 502, 503, 504):
+                wait = 30 * (attempt + 1)
+                print(f"  {model} HTTP {r.status_code}: {short_error(r)} -> retry in {wait}s")
+                time.sleep(wait)
+                continue
+            print(f"  {model} HTTP {r.status_code}: {short_error(r)} -> next model")
+            break
+    return False
+
+
+# ---------------- main ----------------
 
 async def main():
     day_dir = latest_day_dir()
@@ -195,37 +265,66 @@ async def main():
     audio_dir = day_dir / "audio"
     audio_dir.mkdir(exist_ok=True)
 
+    print(f"Pronunciation rules loaded: {len(PRONUNCIATIONS)}, niqqud {'on' if NIQQUD else 'off'}")
+    for p in parts:
+        p["spoken_text"] = speakable(p["text"])
+    (audio_dir / "spoken.txt").write_text(
+        "\n\n".join(f"--- {p['id']} ---\n{p['spoken_text']}" for p in parts), encoding="utf-8")
+
+    sources = {}
+    used = "edge"
+
+    if ENGINE == "gemini":
+        api_key = os.getenv("GEMINI_API_KEY")
+        if not api_key or not GEMINI_TTS_MODELS:
+            print("[!] Gemini TTS needs GEMINI_API_KEY and GEMINI_TTS_MODEL - using Edge")
+        else:
+            style_info = f"style '{GEMINI_TTS_STYLE}'" if GEMINI_TTS_STYLE.strip() else "no style instruction"
+            print(f"Engine: Gemini TTS, voice {GEMINI_TTS_VOICE}, {style_info}, models {GEMINI_TTS_MODELS}")
+            ok = True
+            for i, p in enumerate(parts):
+                if i > 0:
+                    time.sleep(GEMINI_TTS_GAP)
+                src = audio_dir / f"{p['id']}_gemini.wav"
+                print(f"Speaking {p['id']} ({len(p['spoken_text'].split())} words)...")
+                if not gemini_synth(p["spoken_text"], src, api_key):
+                    ok = False
+                    break
+                sources[p["id"]] = src
+            if ok:
+                used = "gemini"
+            else:
+                print("[!] Gemini TTS failed - redoing the whole narration with Edge")
+                sources = {}
+
+    if used == "edge":
+        print(f"Engine: Edge, voice {VOICE}, rate {RATE}, pitch {PITCH}")
+        for p in parts:
+            mp3 = audio_dir / f"{p['id']}.mp3"
+            srt = audio_dir / f"{p['id']}.srt"
+            print(f"Speaking {p['id']} ({len(p['spoken_text'].split())} words)...")
+            await edge_synth(p["spoken_text"], mp3, srt)
+            sources[p["id"]] = mp3
+
     silence = audio_dir / "silence.wav"
     run(["ffmpeg", "-y", "-f", "lavfi", "-i", f"anullsrc=r={SR}:cl=mono",
          "-t", str(PAUSE), str(silence)])
 
-    print(f"Voice: {VOICE}, rate {RATE}, pitch {PITCH}, deep EQ {'on' if DEEP_EQ else 'off'}, "
-          f"niqqud {'on' if NIQQUD else 'off'}")
-    print(f"Pronunciation rules loaded: {len(PRONUNCIATIONS)}")
     t = 0.0
     concat_lines = []
-    spoken_dump = []
     for idx, p in enumerate(parts):
-        text = speakable(p["text"])
-        spoken_dump.append(f"--- {p['id']} ---\n{text}")
-        mp3 = audio_dir / f"{p['id']}.mp3"
         wav = audio_dir / f"{p['id']}.wav"
-        srt = audio_dir / f"{p['id']}.srt"
-        print(f"Speaking {p['id']} ({len(text.split())} words)...")
-        await synth(text, mp3, srt)
-        run(["ffmpeg", "-y", "-i", str(mp3), "-ar", str(SR), "-ac", "1", str(wav)])
+        run(["ffmpeg", "-y", "-i", str(sources[p["id"]]), "-ar", str(SR), "-ac", "1", str(wav)])
         dur = duration(wav)
-
-        p.update({"spoken_text": text, "audio": f"audio/{wav.name}",
-                  "srt": f"audio/{srt.name}" if srt.exists() else None,
+        srt = audio_dir / f"{p['id']}.srt"
+        p.update({"audio": f"audio/{wav.name}",
+                  "srt": f"audio/{srt.name}" if (used == "edge" and srt.exists()) else None,
                   "start": round(t, 3), "duration": round(dur, 3)})
         concat_lines.append(f"file '{wav.name}'")
         t += dur
         if idx < len(parts) - 1:
             concat_lines.append(f"file '{silence.name}'")
             t += PAUSE
-
-    (audio_dir / "spoken.txt").write_text("\n\n".join(spoken_dump), encoding="utf-8")
 
     list_file = audio_dir / "concat.txt"
     list_file.write_text("\n".join(concat_lines) + "\n", encoding="utf-8")
@@ -238,17 +337,19 @@ async def main():
     cmd = ["ffmpeg", "-y", "-i", str(raw)]
     if DEEP_EQ:
         cmd += ["-af", EQ_FILTER, "-ar", str(SR)]
-    cmd += ["-c:a", "libmp3lame", "-b:a", "160k", str(narration)]
+    cmd += ["-c:a", "libmp3lame", "-b:a", "192k", str(narration)]
     run(cmd)
 
-    manifest = {"voice": VOICE, "rate": RATE, "pitch": PITCH, "deep_eq": DEEP_EQ,
-                "niqqud": NIQQUD and bool(_nakdan), "pause": PAUSE,
+    manifest = {"engine": used,
+                "voice": GEMINI_TTS_VOICE if used == "gemini" else VOICE,
+                "deep_eq": DEEP_EQ, "niqqud": NIQQUD, "pause": PAUSE,
                 "total_duration": round(duration(narration), 3),
                 "narration": "audio/narration.mp3", "parts": parts}
     (day_dir / "audio.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2),
                                         encoding="utf-8")
 
-    print(f"\nParts: {len(parts)}, total {manifest['total_duration'] / 60:.1f} min")
+    print(f"\nEngine used: {used}")
+    print(f"Parts: {len(parts)}, total {manifest['total_duration'] / 60:.1f} min")
     print(f"Saved -> {narration}")
 
 
