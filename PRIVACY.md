@@ -13,7 +13,7 @@ This tool uses YouTube API Services. By using it you agree to the YouTube Terms 
 Google's Privacy Policy applies to data handled through YouTube API Services: https://policies.google.com/privacy
 
 ## Data accessed, used and stored
-- The tool authenticates only the operator's own YouTube channel account through OAuth 2.0, using the minimum scope needed to upload videos and set their thumbnails.
+- The tool authenticates only the operator's own YouTube channel account through OAuth 2.0. It requests permission to view that account and to manage its videos, which it uses only to upload the daily video and set its thumbnail.
 - It calls only two API methods: videos.insert (upload the daily video) and thumbnails.set (set its thumbnail).
 - It does not read, collect, store or share any data about other YouTube users, their channels, comments or viewing activity.
 - The OAuth refresh token for the operator's account is stored only as an encrypted secret in the operator's private GitHub Actions settings and is never published or shared.
