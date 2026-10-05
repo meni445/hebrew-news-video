@@ -77,7 +77,7 @@ jobs:
         env:
           TTS_ENGINE: "gemini"
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          GEMINI_TTS_MODEL: "gemini-3.8-flash-lite-tts,gemini-3.1-flash-tts"
+          GEMINI_TTS_MODEL: "gemini-3.8-flash-lite-tts,gemini-3.8-flash-tts,gemini-3.1-flash-tts-preview,gemini-2.5-flash-preview-tts"
           GEMINI_TTS_VOICE: "Charon"
           GEMINI_TTS_STYLE: ""
           TTS_VOICE: "he-IL-AvriNeural"
@@ -86,6 +86,7 @@ jobs:
           TTS_NIQQUD: "0"
           TTS_PAUSE: "0.6"
           TTS_CLEAN: "1"
+          TTS_SINGLE: "1"
         run: python tts.py
 
       - name: Avatar lip-sync (Wav2Lip)
