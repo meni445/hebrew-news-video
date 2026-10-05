@@ -193,20 +193,3 @@ def make_overlay(path, kind, text_left, title="", index=0, total=0):
         draw_lines(d, ["תודה שצפיתם"], font(72), H - 260, WHITE)
         draw_lines(d, ["הירשמו לערוץ לעדכונים יומיים"], font(44, bold=False), H - 160, GREY)
     img.save(path)
-
-
-# ---------------- media track (full frame) ----------------
-
-FILL_GRAPH = (f"[0:v]split=2[a][b];"
-              f"[a]scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},"
-              f"boxblur=30:3,eq=brightness=-0.15[bg];"
-              f"[b]scale={W}:{H}:force_original_aspect_ratio=decrease[fg];"
-              f"[bg][fg]overlay=(W-w)/2:(H-h)/2,setsar=1,fps={FPS},format=yuv420p[v]")
-
-
-def enc_args():
-    return ["-an", "-c:v", "libx264", "-preset", PRESET, "-crf", "21", "-r", str(FPS)]
-
-
-def media_clip(src, kind, frames, out):
-    inp
