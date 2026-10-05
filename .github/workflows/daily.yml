@@ -85,6 +85,7 @@ jobs:
           TTS_DEEP_EQ: "0"
           TTS_NIQQUD: "0"
           TTS_PAUSE: "0.6"
+          TTS_CLEAN: "1"
         run: python tts.py
 
       - name: Avatar lip-sync (Wav2Lip)
@@ -103,6 +104,8 @@ jobs:
         env:
           CHANNEL_NAME: "חדשות היום"
           PRESENTER_VIDEO: "assets/presenter.mp4"
+          BG_IMAGE: "background.jpg"
+          TEXT_CARDS: "1"
         run: python render.py
 
       - name: Upload to YouTube
