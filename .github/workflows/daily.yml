@@ -28,7 +28,10 @@ jobs:
       - name: Install avatar dependencies
         run: |
           pip install torch --index-url https://download.pytorch.org/whl/cpu
-          pip install librosa opencv-python-headless tqdm
+          pip install librosa tqdm
+          pip uninstall -y opencv-python opencv-contrib-python opencv-python-headless opencv-contrib-python-headless || true
+          pip install opencv-python-headless
+          python -c "import cv2; print('OpenCV', cv2.__version__, hasattr(cv2, 'CascadeClassifier'))"
 
       - name: Cache models and fonts
         uses: actions/cache@v4
