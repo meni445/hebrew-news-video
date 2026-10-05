@@ -37,7 +37,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: models
-          key: models-v3-heebo-wav2lip
+          key: models-v4-heebo-wav2lip
 
       - name: Collect Telegram posts
         env:
@@ -91,7 +91,12 @@ jobs:
         env:
           AVATAR_ENABLED: "1"
           AVATAR_IMAGE: "presenter.jpg"
-          WAV2LIP_MODEL_URLS: "https://github.com/justinjohn0306/Wav2Lip/releases/download/models/wav2lip_gan.pth,https://github.com/anothermartz/Easy-Wav2Lip/releases/download/Prerequesits/Wav2Lip_GAN.pth"
+          AVATAR_VIDEO: "presenter.mp4"
+          AVATAR_DETECTOR: "s3fd"
+          AVATAR_MOTION: "1"
+          WAV2LIP_PADS: "0 15 0 0"
+          WAV2LIP_MODEL: "models/wav2lip.pth"
+          WAV2LIP_MODEL_URLS: "https://github.com/justinjohn0306/Wav2Lip/releases/download/models/wav2lip.pth,https://github.com/anothermartz/Easy-Wav2Lip/releases/download/Prerequesits/Wav2Lip.pth"
         run: python avatar.py
 
       - name: Render video
