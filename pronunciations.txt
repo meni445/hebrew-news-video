@@ -1,6 +1,2 @@
-# word as written = how the voice should say it (niqqud or full words)
-# one per line. Longer phrases are applied first.
-ארה"ב = ארצות הברית
-נתב"ג = נַתְבַּ"ג
-טהראן = טֶהֶרָן
-חיזבאללה = חִיזְבַּאלְלָה
+# word as written = how the voice should say it (full words, or niqqud only if really needed)
+# one per line. Longer phrases are applied first. Lines starting with # are ignored.
