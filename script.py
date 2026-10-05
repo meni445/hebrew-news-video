@@ -11,7 +11,7 @@ import requests
 MODELS = [m.strip() for m in os.getenv("GEMINI_MODEL", "gemini-3.8-flash").split(",") if m.strip()]
 RETRIES_PER_MODEL = int(os.getenv("GEMINI_RETRIES", "3"))
 RETRY_WAIT = int(os.getenv("GEMINI_WAIT", "20"))          # seconds, grows each retry
-PROOFREAD = os.getenv("PROOFREAD", "0") == "1"             # off by default
+PROOFREAD = int(os.getenv("PROOFREAD", "0") or 0)          # 0 off, 1 spelling pass, 2 spelling + editor pass
 SCRIPT_ATTEMPTS = int(os.getenv("SCRIPT_ATTEMPTS", "3"))   # re-ask if the JSON is broken
 TARGET_MINUTES = float(os.getenv("TARGET_MINUTES", "5"))
 MAX_STORIES = int(os.getenv("MAX_STORIES", "8"))
@@ -90,22 +90,45 @@ POSTS:
 __POSTS__
 """
 
-PROOF_PROMPT = """You are a Hebrew copy editor. Below is a JSON news script that
-will be read aloud by a Hebrew text-to-speech voice.
+EDIT_RULES = """Rules for every change:
+- Do NOT add, remove, merge or reorder stories.
+- Do NOT change facts, names, numbers, dates or attributions.
+- Keep exactly the same JSON keys, the same number of segments and the same number of tags.
+- Hebrew acronyms must use the gershayim character ״ (e.g. צה״ל), never the ASCII double quote.
 
-Fix ONLY:
-- spelling and grammar mistakes and typos
-- any characters that are not Hebrew (Arabic, Korean, Chinese, Cyrillic etc.):
-  replace them with the correct Hebrew word that fits the sentence
-
-Do NOT add, remove, merge or reorder stories. Do NOT change facts, names,
-numbers or attributions. Keep exactly the same JSON keys and the same number
-of segments. Hebrew acronyms must use the gershayim character ״ (e.g. צה״ל),
-never the ASCII double quote. Return ONLY the corrected JSON, no markdown.
+Return ONLY JSON, no markdown, in this shape:
+{"script": <the full corrected JSON, same structure as below>,
+ "changes": [{"from": "original words", "to": "corrected words", "reason": "short reason"}]}
+If nothing needs fixing, return the JSON unchanged with an empty "changes" list.
 
 JSON:
 __JSON__
 """
+
+SPELLING_PROMPT = """You are a Hebrew copy editor. Below is the content of a Hebrew YouTube news
+video: its title, description, tags, and a script that a Hebrew text-to-speech voice reads aloud.
+
+Fix ONLY:
+- spelling and grammar mistakes and typos (in every field, including the title, description,
+  tags and headlines)
+- any characters that are not Hebrew (Arabic, Korean, Chinese, Cyrillic etc.):
+  replace them with the correct Hebrew word that fits the sentence
+
+""" + EDIT_RULES
+
+EDITOR_PROMPT = """You are a senior Hebrew news editor doing the final check before publishing.
+Below is the content of a Hebrew YouTube news video: its title, description, tags, and a
+script that a Hebrew text-to-speech voice reads aloud.
+
+Read every field carefully, word by word, and fix:
+- real Hebrew words that are WRONG IN CONTEXT - a spell checker misses these
+  (for example "לח ולעולם" instead of "בארץ ובעולם", "בבצורת החקירות" instead of "בלשכת החקירות")
+- wrong gender or number agreement, wrong prepositions, missing or extra words
+- broken, cut-off or unclear sentences
+- phrases that sound unnatural when read aloud in a news broadcast
+- the title and headlines must be correct, natural Hebrew with no typos at all
+
+""" + EDIT_RULES
 
 
 def latest_day_dir():
@@ -219,34 +242,67 @@ def generate_script(prompt, api_key):
     sys.exit("Could not get a valid script from Gemini")
 
 
-def proofread(script, api_key, model):
-    subset = {
+# ---------------- proofreading ----------------
+
+def editable(script):
+    return {
+        "title": script.get("title", ""),
+        "description": script.get("description", ""),
+        "tags": script.get("tags", []),
         "intro": script.get("intro", ""),
         "segments": [{"headline": s.get("headline", ""), "narration": s.get("narration", "")}
                      for s in script["segments"]],
         "outro": script.get("outro", ""),
     }
-    prompt = PROOF_PROMPT.replace("__JSON__", json.dumps(subset, ensure_ascii=False, indent=2))
-    print("Proofreading...")
+
+
+def apply_edit(script, fixed):
+    if not isinstance(fixed, dict):
+        return False
+    segs = fixed.get("segments")
+    if not isinstance(segs, list) or len(segs) != len(script["segments"]):
+        return False
+    for key in ("title", "description", "intro", "outro"):
+        val = fixed.get(key)
+        if isinstance(val, str) and val.strip():
+            script[key] = val
+    tags = fixed.get("tags")
+    if isinstance(tags, list) and tags and all(isinstance(t, str) for t in tags):
+        script["tags"] = tags
+    for orig, new in zip(script["segments"], segs):
+        if not isinstance(new, dict):
+            continue
+        for key in ("headline", "narration"):
+            val = new.get(key)
+            if isinstance(val, str) and val.strip():
+                orig[key] = val
+    return True
+
+
+def edit_pass(script, api_key, model, template, label):
+    prompt = template.replace("__JSON__", json.dumps(editable(script), ensure_ascii=False, indent=2))
+    print(f"{label}...")
     raw, _ = call_gemini(prompt, api_key, [model])
     if raw is None:
-        print("  proofread failed, keeping original")
-        return script
+        print(f"  {label} failed, keeping text as is")
+        return []
     try:
-        fixed = parse_json(raw)
+        data = parse_json(raw)
     except Exception as e:
-        print(f"  proofread returned invalid JSON ({e}), keeping original")
-        return script
-    if len(fixed.get("segments", [])) != len(script["segments"]):
-        print("  proofread changed the number of segments, keeping original")
-        return script
-    script["intro"] = fixed.get("intro") or script.get("intro", "")
-    script["outro"] = fixed.get("outro") or script.get("outro", "")
-    for orig, new in zip(script["segments"], fixed["segments"]):
-        orig["headline"] = new.get("headline") or orig.get("headline", "")
-        orig["narration"] = new.get("narration") or orig.get("narration", "")
-    print("  proofread applied")
-    return script
+        print(f"  {label} returned invalid JSON ({e}), keeping text as is")
+        return []
+    fixed = data.get("script", data) if isinstance(data, dict) else None
+    changes = data.get("changes", []) if isinstance(data, dict) else []
+    if not isinstance(changes, list):
+        changes = []
+    if not apply_edit(script, fixed):
+        print(f"  {label} changed the structure, keeping text as is")
+        return []
+    print(f"  {label}: {len(changes)} change(s)")
+    for c in changes[:40]:
+        if isinstance(c, dict):
+            print(f"    {c.get('from', '')}  ->  {c.get('to', '')}   ({c.get('reason', '')})")
+    return [dict(c, layer=label) for c in changes if isinstance(c, dict)]
 
 
 def clean_text(text, where, warnings):
@@ -300,8 +356,11 @@ def main():
     print(f"Sending {n} unique posts...")
     script, used_model = generate_script(prompt, api_key)
 
-    if PROOFREAD:
-        script = proofread(script, api_key, used_model)
+    all_changes = []
+    if PROOFREAD >= 1:
+        all_changes += edit_pass(script, api_key, used_model, SPELLING_PROMPT, "Proofreading (spelling)")
+    if PROOFREAD >= 2:
+        all_changes += edit_pass(script, api_key, used_model, EDITOR_PROMPT, "Proofreading (editor)")
 
     script = clean_script(script)
 
@@ -314,6 +373,7 @@ def main():
     script["date"] = date_he
     script["weekday"] = weekday_he
     script["model"] = used_model
+    script["proofread_changes"] = all_changes
 
     (day_dir / "script.json").write_text(json.dumps(script, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -328,7 +388,7 @@ def main():
     print(f"Model used: {used_model}")
     print(f"Title: {script.get('title')}")
     print(f"Stories: {len(script['segments'])}, words: {total_words}, "
-          f"~{total_words / WORDS_PER_MIN:.1f} min")
+          f"~{total_words / WORDS_PER_MIN:.1f} min, proofread changes: {len(all_changes)}")
     print(f"Saved -> {day_dir / 'script.json'}")
 
 
