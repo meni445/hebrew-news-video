@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   # GitHub cron is UTC: 01:00 UTC = 04:00 Israel summer time / 03:00 winter time.
   schedule:
-    - cron: "0 1 * * *"
+    - cron: "37 0 * * *"
 
 jobs:
   run:
