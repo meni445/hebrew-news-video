@@ -17,6 +17,17 @@ TARGET_MINUTES = float(os.getenv("TARGET_MINUTES", "5"))
 MAX_STORIES = int(os.getenv("MAX_STORIES", "8"))
 MAX_POST_CHARS = int(os.getenv("MAX_POST_CHARS", "700"))
 WORDS_PER_MIN = 130  # approx. Hebrew speaking pace
+# Name the Telegram channels in the YouTube description (1) or write a generic source line (0)
+DESC_SOURCES = os.getenv("DESC_SOURCES", "1") == "1"
+# Ask Gemini for a short, punchy thumbnail text (used by render.py with THUMB_V2=1). Off by default.
+THUMB_TEXT = os.getenv("THUMB_TEXT", "0") == "1"
+
+THUMB_RULES = """
+Also add the key "thumbnail_text": 2 to 4 Hebrew words (max 22 characters) for the
+video thumbnail, about the FIRST (most important) story. Big, concrete and factual,
+like a newspaper front-page headline. No question marks, no emojis, no exaggeration
+or claims that are not in the posts, no graphic words.
+"""
 
 HEB_DAYS = ["שני", "שלישי", "רביעי", "חמישי", "שישי", "שבת", "ראשון"]  # Monday=0
 
@@ -253,6 +264,7 @@ def editable(script):
         "segments": [{"headline": s.get("headline", ""), "narration": s.get("narration", "")}
                      for s in script["segments"]],
         "outro": script.get("outro", ""),
+        **({"thumbnail_text": script["thumbnail_text"]} if script.get("thumbnail_text") else {}),
     }
 
 
@@ -262,7 +274,7 @@ def apply_edit(script, fixed):
     segs = fixed.get("segments")
     if not isinstance(segs, list) or len(segs) != len(script["segments"]):
         return False
-    for key in ("title", "description", "intro", "outro"):
+    for key in ("title", "description", "intro", "outro", "thumbnail_text"):
         val = fixed.get(key)
         if isinstance(val, str) and val.strip():
             script[key] = val
@@ -319,6 +331,8 @@ def clean_script(script):
     warnings = []
     for key in ("title", "description", "intro", "outro"):
         script[key] = clean_text(script.get(key, ""), key, warnings)
+    if script.get("thumbnail_text"):
+        script["thumbnail_text"] = clean_text(script["thumbnail_text"], "thumbnail_text", warnings).strip()
     for i, s in enumerate(script["segments"], 1):
         s["headline"] = clean_text(s.get("headline", ""), f"segment {i} headline", warnings)
         s["narration"] = clean_text(s.get("narration", ""), f"segment {i} narration", warnings)
@@ -345,7 +359,8 @@ def main():
     words = int(TARGET_MINUTES * WORDS_PER_MIN)
     min_words = int(words * 0.85)
 
-    prompt = (PROMPT.replace("__MAX_STORIES__", str(MAX_STORIES))
+    template = PROMPT.replace("POSTS:\n__POSTS__", THUMB_RULES + "\nPOSTS:\n__POSTS__") if THUMB_TEXT else PROMPT
+    prompt = (template.replace("__MAX_STORIES__", str(MAX_STORIES))
                     .replace("__MIN_WORDS__", str(min_words))
                     .replace("__WORDS__", str(words))
                     .replace("__MINUTES__", f"{TARGET_MINUTES:g}")
@@ -364,10 +379,14 @@ def main():
 
     script = clean_script(script)
 
-    channels = ", ".join(sorted(data.get("channels", {}).keys()))
+    if DESC_SOURCES:
+        channels = ", ".join(sorted(data.get("channels", {}).keys()))
+        source_line = f"מקורות: ערוצי טלגרם {channels}"
+    else:
+        source_line = "מבוסס על דיווחים שפורסמו בערוצי חדשות בטלגרם."
     script["description"] = (
         script.get("description", "").strip()
-        + f"\n\nמקורות: ערוצי טלגרם {channels}"
+        + f"\n\n{source_line}"
         + "\nהסרטון נוצר בסיוע בינה מלאכותית."
     )
     script["date"] = date_he
@@ -387,6 +406,8 @@ def main():
     total_words = len(full.split())
     print(f"Model used: {used_model}")
     print(f"Title: {script.get('title')}")
+    if THUMB_TEXT:
+        print(f"Thumbnail text: {script.get('thumbnail_text') or '(none - render.py will use the first headline)'}")
     print(f"Stories: {len(script['segments'])}, words: {total_words}, "
           f"~{total_words / WORDS_PER_MIN:.1f} min, proofread changes: {len(all_changes)}")
     print(f"Saved -> {day_dir / 'script.json'}")
