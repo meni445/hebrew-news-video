@@ -56,6 +56,8 @@ jobs:
           PROOFREAD: "2"
           TARGET_MINUTES: "5"
           MAX_STORIES: "8"
+          DESC_SOURCES: "0"
+          THUMB_TEXT: "1"
         run: python script.py
 
       - name: Download news media (Telegram + check)
@@ -107,6 +109,7 @@ jobs:
           PRESENTER_VIDEO: "assets/presenter.mp4"
           BG_IMAGE: "background.jpg"
           TEXT_CARDS: "1"
+          THUMB_V2: "1"
         run: python render.py
 
       - name: Upload to YouTube
