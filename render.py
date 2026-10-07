@@ -31,6 +31,11 @@ BG_IMAGE = Path(os.getenv("BG_IMAGE", "")) if os.getenv("BG_IMAGE", "").strip() 
 TEXT_CARDS = os.getenv("TEXT_CARDS", "0") == "1"
 TEXT_SIZE = int(os.getenv("TEXT_CARD_SIZE", "52"))
 TEXT_LINES = int(os.getenv("TEXT_CARD_LINES", "5"))
+# Click-focused thumbnail: top-story photo, 2-4 huge words, presenter, date badge. Off by default.
+THUMB_V2 = os.getenv("THUMB_V2", "0") == "1"
+THUMB_TAGLINE = os.getenv("THUMB_TAGLINE", "")            # optional strip at the bottom
+THUMB_PRESENTER = Path(os.getenv("THUMB_PRESENTER", "presenter.jpg"))
+YELLOW = (255, 214, 0)
 
 BG_TOP = (14, 22, 40)
 BG_BOTTOM = (28, 44, 78)
@@ -290,6 +295,101 @@ def make_overlay(path, kind, text_left, title="", index=0, total=0):
         draw_lines(d, ["הירשמו לערוץ לעדכונים יומיים"], font(44, bold=False), H - 160, GREY)
     img.save(path)
 
+# ---------------- thumbnail v2 ----------------
+
+def thumb_base(day_dir, media):
+    """Best picture for the thumbnail: photo of the first story > any photo > video frame > background."""
+    order = sorted(media)
+    for want in ("photo", "video"):
+        for seg in order:
+            for it in media[seg]:
+                src = day_dir / it["file"]
+                if it["type"] != want or not src.exists():
+                    continue
+                try:
+                    if want == "photo":
+                        return ImageOps.fit(Image.open(src).convert("RGB"), (W, H))
+                    frame = day_dir / "frames" / "thumb_frame.jpg"
+                    if run_ok(["ffmpeg", "-y", "-ss", "1", "-i", str(src), "-frames:v", "1", str(frame)]):
+                        return ImageOps.fit(Image.open(frame).convert("RGB"), (W, H))
+                except Exception:
+                    continue
+    bg = load_bg()                                    # no media: soften the channel art behind the text
+    if bg is None:
+        return Image.open(day_dir / "frames" / "card.png").convert("RGB")
+    return ImageEnhance.Brightness(bg.filter(ImageFilter.GaussianBlur(14))).enhance(0.6)
+
+
+def big_lines(draw, text, max_w, max_h):
+    """Largest font size where the text fits in at most 2 lines."""
+    for size in range(230, 90, -10):
+        f = font(size)
+        lines = wrap(draw, text, f, max_w)
+        if len(lines) <= 2 and len(lines) * size * 1.12 <= max_h:
+            return f, lines
+    f = font(90)
+    return f, wrap(draw, text, f, max_w)[:2]
+
+
+def make_thumbnail_v2(out, base, text, date_text):
+    img = ImageEnhance.Contrast(ImageEnhance.Color(base).enhance(1.25)).enhance(1.1).convert("RGBA")
+
+    shade = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    d = ImageDraw.Draw(shade)
+    for x in range(W):                                  # dark on the right, where the text sits
+        a = int(215 * max(0.0, (x - W * 0.25) / (W * 0.75)) ** 0.8)
+        d.line([(x, 0), (x, H)], fill=(5, 10, 25, a))
+    for y in range(H - 260, H):
+        d.line([(0, y), (W, y)], fill=(0, 0, 0, int(160 * (y - (H - 260)) / 260)))
+    img.alpha_composite(shade)
+
+    d = ImageDraw.Draw(img)
+    has_face = THUMB_PRESENTER.exists()
+    text_left = 640 if has_face else 120
+    max_w = TEXT_RIGHT - text_left
+
+    # channel badge + date badge (top right)
+    f_b = font(64)
+    bw = int(text_w(d, CHANNEL_NAME, f_b)) + 70
+    d.rectangle([TEXT_RIGHT - bw, 50, TEXT_RIGHT, 150], fill=ACCENT)
+    draw_rtl(d, CHANNEL_NAME, f_b, TEXT_RIGHT - 35, 60, WHITE)
+    if date_text:
+        f_d = font(52)
+        dw = int(d.textlength(date_text, font=f_d)) + 50
+        d.rectangle([TEXT_RIGHT - dw, 165, TEXT_RIGHT, 245], fill=YELLOW)
+        d.text((TEXT_RIGHT - dw + 25, 172), date_text, font=f_d, fill=(10, 10, 10))
+
+    # the big words, first line white, second line yellow, thick outline
+    f, lines = big_lines(d, text, max_w, H - 600)
+    total_h = int(len(lines) * f.size * 1.12)
+    y = 300 + (H - 300 - 230 - total_h) // 2
+    for k, line in enumerate(lines):
+        disp = rtl(line)
+        w = d.textlength(disp, font=f)
+        d.text((TEXT_RIGHT - w, y), disp, font=f, fill=WHITE if k == 0 else YELLOW,
+               stroke_width=max(6, f.size // 22), stroke_fill=(0, 0, 0))
+        y += int(f.size * 1.12)
+
+    # presenter, bottom left, framed
+    if has_face:
+        try:
+            pw, ph = 470, 590
+            face = ImageOps.fit(Image.open(THUMB_PRESENTER).convert("RGB"), (pw, ph), centering=(0.5, 0.25))
+            px, py = 60, H - ph - 40
+            d.rectangle([px - 8, py - 8, px + pw + 7, py + ph + 7], fill=ACCENT)
+            img.paste(face, (px, py))
+        except Exception as e:
+            print(f"  [!] presenter not added to thumbnail ({e})")
+
+    if THUMB_TAGLINE.strip():
+        f_t = font(54)
+        tw = int(text_w(d, THUMB_TAGLINE, f_t)) + 60
+        d.rectangle([TEXT_RIGHT - tw, H - 130, TEXT_RIGHT, H - 50], fill=(0, 0, 0))
+        draw_rtl(d, THUMB_TAGLINE, f_t, TEXT_RIGHT - 30, H - 122, WHITE)
+
+    img.convert("RGB").save(out)
+
+
 # ---------------- media track (full frame) ----------------
 
 FILL_GRAPH = (f"[0:v]split=2[a][b];"
@@ -448,6 +548,18 @@ def main():
 
     track = build_track(day_dir, parts, total, media, card, text_card)
 
+    if THUMB_V2:
+        words = (script.get("thumbnail_text") or "").strip()
+        if not words:
+            first = script.get("segments", [{}])[0].get("headline", "") if script.get("segments") else ""
+            words = " ".join(first.split()[:4]) or script.get("title", "")
+        try:
+            make_thumbnail_v2(day_dir / "thumbnail.png", thumb_base(day_dir, media), words,
+                              script.get("date", ""))
+            print(f"Thumbnail v2: '{words}'")
+        except Exception as e:
+            print(f"[!] thumbnail v2 failed ({e}), using the classic one")
+            (day_dir / "thumbnail.png").unlink(missing_ok=True)
     # thumbnail: first story photo full-frame (or card) + chrome + intro text
     base = Image.open(card).convert("RGB")
     for seg in sorted(media):
@@ -465,7 +577,8 @@ def main():
     thumb_title = frames_dir / "intro_thumb.png"
     make_overlay(thumb_title, "intro", MARGIN, title=script.get("title", ""))
     thumb.alpha_composite(Image.open(thumb_title))
-    thumb.convert("RGB").save(day_dir / "thumbnail.png")
+    if not THUMB_V2 or not (day_dir / "thumbnail.png").exists():
+        thumb.convert("RGB").save(day_dir / "thumbnail.png")
 
     cmd = ["ffmpeg", "-y", "-i", str(track),
            "-loop", "1", "-framerate", str(FPS), "-i", str(chrome)]
