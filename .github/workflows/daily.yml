@@ -119,6 +119,8 @@ jobs:
           YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
           YT_UPLOAD: "1"
           YT_PRIVACY: "public"
+          YT_RICH: "1"
+          CHANNEL_NAME: "חדשות היום"
         run: python upload.py
 
       - name: Upload output
