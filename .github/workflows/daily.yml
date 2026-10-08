@@ -129,6 +129,7 @@ jobs:
           TTS_LEVEL: "1"
           TTS_GLITCH_FIX: "1"
           TTS_PITCH_MATCH: "0"
+          TTS_MAX_SEC_PER_WORD: "0.6"
         run: python tts.py
 
       - name: Avatar lip-sync (Wav2Lip)
