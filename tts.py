@@ -32,6 +32,14 @@ GEMINI_TTS_RETRIES = int(os.getenv("GEMINI_TTS_RETRIES", "4"))
 # at the pauses between stories. Uses 1 request per video instead of one per part.
 # If it fails, falls back to one request per part. Off by default.
 GEMINI_TTS_SINGLE = os.getenv("TTS_SINGLE", "0") == "1"
+# With TTS_SINGLE: send the script in chunks of about this many words instead of all at once.
+# Long generations drift in pitch; shorter chunks keep the voice steadier. 0 = whole script (default).
+CHUNK_WORDS = int(os.getenv("TTS_CHUNK_WORDS", "0") or 0)
+# Cut noise/garbage the voice model adds after the last word of a part. Off by default.
+TAIL_GUARD = os.getenv("TTS_TAIL_GUARD", "0") == "1"
+# Bring every part to the same loudness so the voice doesn't jump between stories. Off by default.
+LEVEL = os.getenv("TTS_LEVEL", "0") == "1"
+LEVEL_DB = float(os.getenv("TTS_LEVEL_DB", "-20"))
 
 PAUSE = float(os.getenv("TTS_PAUSE", "0.6"))
 DEEP_EQ = os.getenv("TTS_DEEP_EQ", "0") == "1"
@@ -339,7 +347,115 @@ def split_single(wav_path, parts, audio_dir):
     return out
 
 
+def make_chunks(parts):
+    """Group consecutive parts into chunks of up to CHUNK_WORDS words (at least one part each)."""
+    if CHUNK_WORDS <= 0:
+        return [parts]
+    chunks, cur, n = [], [], 0
+    for p in parts:
+        w = len(p["spoken_text"].split())
+        if cur and n + w > CHUNK_WORDS:
+            chunks.append(cur)
+            cur, n = [], 0
+        cur.append(p)
+        n += w
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+
+def synth_chunks(parts, audio_dir, api_key):
+    """One request per chunk, split at the pauses. Returns {part_id: wav} or None."""
+    chunks = make_chunks(parts)
+    out = {}
+    for k, chunk in enumerate(chunks):
+        if k > 0:
+            time.sleep(GEMINI_TTS_GAP)
+        text = "\n\n".join(p["spoken_text"] for p in chunk)
+        ids = ", ".join(p["id"] for p in chunk)
+        print(f"Request {k + 1}/{len(chunks)}: {ids} ({len(text.split())} words)...")
+        wav = audio_dir / f"chunk{k:02d}_gemini.wav"
+        if not gemini_synth(text, wav, api_key, timeout=900):
+            return None
+        if len(chunk) == 1:
+            out[chunk[0]["id"]] = wav
+            continue
+        try:
+            split = split_single(wav, chunk, audio_dir)
+        except Exception as e:
+            print(f"  [!] split failed: {e}")
+            split = None
+        if not split:
+            return None
+        out.update(split)
+    return out
+
+
 # ---------------- cleanup ----------------
+
+def read_wav(path):
+    import numpy as np
+    with wave.open(str(path), "rb") as w:
+        sr = w.getframerate()
+        data = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16).astype(np.float32)
+    return data, sr
+
+
+def write_wav(path, data, sr):
+    import numpy as np
+    with wave.open(str(path), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(sr)
+        w.writeframes(np.clip(data, -32768, 32767).astype(np.int16).tobytes())
+
+
+def trim_tail(path, expected):
+    """If a part runs far longer than its words need, cut at the first pause after the expected end."""
+    import numpy as np
+    data, sr = read_wav(path)
+    dur = len(data) / sr
+    if dur <= expected * 1.35 + 1.5:
+        return 0.0
+    for a, b in find_pauses(data, sr):
+        if a >= expected * 0.85 and a < dur - 0.4:
+            end = int((a + 0.12) * sr)
+            out = data[:end].copy()
+            fade = min(len(out) // 4, int(sr * 0.06))
+            if fade > 0:
+                out[-fade:] *= np.linspace(1.0, 0.0, fade, dtype=np.float32)
+            write_wav(path, out, sr)
+            return dur - end / sr
+    return 0.0
+
+
+def speech_rms_db(data, sr):
+    import numpy as np
+    flen = max(1, int(sr * 0.02))
+    nf = len(data) // flen
+    if nf < 5:
+        return None
+    x = data[:nf * flen].reshape(nf, flen)
+    rms = np.sqrt((x ** 2).mean(axis=1)) + 1e-9
+    db = 20 * np.log10(rms / 32768)
+    loud = db[db > np.percentile(db, 95) - 25]           # speech frames only
+    if len(loud) == 0:
+        return None
+    return float(20 * np.log10(np.sqrt((10 ** (loud / 10)).mean())))
+
+
+def level_part(path, target_db):
+    data, sr = read_wav(path)
+    cur = speech_rms_db(data, sr)
+    if cur is None:
+        return 0.0
+    gain_db = max(-8.0, min(8.0, target_db - cur))
+    data = data * (10 ** (gain_db / 20))
+    peak = abs(data).max() if len(data) else 0
+    if peak > 32000:                                       # never clip
+        data = data * (32000 / peak)
+    write_wav(path, data, sr)
+    return gain_db
 
 def clean_edges(path):
     """Trim non-speech noise at both ends of a mono 16-bit WAV and fade the edges."""
@@ -409,7 +525,12 @@ async def main():
             style_info = f"style '{GEMINI_TTS_STYLE}'" if GEMINI_TTS_STYLE.strip() else "no style instruction"
             print(f"Engine: Gemini TTS, voice {GEMINI_TTS_VOICE}, {style_info}, models {GEMINI_TTS_MODELS}")
             ok = False
-            if GEMINI_TTS_SINGLE and len(parts) > 1:
+            if GEMINI_TTS_SINGLE and len(parts) > 1 and CHUNK_WORDS > 0:
+                print(f"Chunked requests: up to {CHUNK_WORDS} words each")
+                split = synth_chunks(parts, audio_dir, api_key)
+                if split:
+                    sources, ok = split, True
+            elif GEMINI_TTS_SINGLE and len(parts) > 1:
                 whole = audio_dir / "whole_gemini.wav"
                 text = "\n\n".join(p["spoken_text"] for p in parts)
                 print(f"Single request: whole script ({len(text.split())} words)...")
@@ -455,9 +576,8 @@ async def main():
          "-t", str(PAUSE), "-c:a", "pcm_s16le", str(silence)])
     print(f"Noise trim at part edges: {'on' if CLEAN else 'off'}")
 
-    t = 0.0
-    concat_lines = []
-    for idx, p in enumerate(parts):
+    wavs = {}
+    for p in parts:
         wav = audio_dir / f"{p['id']}.wav"
         run(["ffmpeg", "-y", "-i", str(sources[p["id"]]), "-ar", str(SR), "-ac", "1",
              "-c:a", "pcm_s16le", str(wav)])
@@ -468,6 +588,34 @@ async def main():
                     print(f"  {p['id']}: trimmed {cut[0]:.2f}s at start, {cut[1]:.2f}s at end")
             except Exception as e:
                 print(f"  [!] cleanup failed for {p['id']} ({e}), keeping it as is")
+        wavs[p["id"]] = wav
+
+    if TAIL_GUARD and len(parts) >= 3:
+        rates = sorted(len(p["spoken_text"].split()) / max(0.5, duration(wavs[p["id"]])) for p in parts)
+        rate = rates[len(rates) // 2]                       # median words per second
+        print(f"Tail guard: speaking rate {rate:.2f} words/s")
+        for p in parts:
+            expected = len(p["spoken_text"].split()) / rate
+            try:
+                cut = trim_tail(wavs[p["id"]], expected)
+                if cut > 0:
+                    print(f"  {p['id']}: removed {cut:.1f}s of trailing noise")
+            except Exception as e:
+                print(f"  [!] tail guard failed for {p['id']} ({e})")
+
+    if LEVEL:
+        print(f"Leveling parts to {LEVEL_DB:g} dB")
+        for p in parts:
+            try:
+                g = level_part(wavs[p["id"]], LEVEL_DB)
+                print(f"  {p['id']}: {g:+.1f} dB")
+            except Exception as e:
+                print(f"  [!] leveling failed for {p['id']} ({e})")
+
+    t = 0.0
+    concat_lines = []
+    for idx, p in enumerate(parts):
+        wav = wavs[p["id"]]
         dur = duration(wav)
         srt = audio_dir / f"{p['id']}.srt"
         p.update({"audio": f"audio/{wav.name}",
@@ -496,6 +644,7 @@ async def main():
     manifest = {"engine": used,
                 "voice": GEMINI_TTS_VOICE if used == "gemini" else VOICE,
                 "deep_eq": DEEP_EQ, "niqqud": NIQQUD, "pause": PAUSE, "clean": CLEAN,
+                "chunk_words": CHUNK_WORDS, "tail_guard": TAIL_GUARD, "level": LEVEL,
                 "total_duration": round(duration(narration), 3),
                 "narration": "audio/narration.mp3", "parts": parts}
     (day_dir / "audio.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2),
