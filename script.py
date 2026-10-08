@@ -21,6 +21,18 @@ WORDS_PER_MIN = 130  # approx. Hebrew speaking pace
 DESC_SOURCES = os.getenv("DESC_SOURCES", "1") == "1"
 # Ask Gemini for a short, punchy thumbnail text (used by render.py with THUMB_V2=1). Off by default.
 THUMB_TEXT = os.getenv("THUMB_TEXT", "0") == "1"
+# Fixed intro written by the code instead of Gemini, e.g.
+# "שלום וברוכים הבאים לחדשות היום. זהו סיכום החדשות של יום {weekday}, {date}." ("" = Gemini writes it)
+INTRO_TEMPLATE = os.getenv("INTRO_TEMPLATE", "")
+# Forbid Arabic loanwords and slang in the narration (e.g. מברוק, יאללה). Off by default.
+NO_SLANG = os.getenv("NO_SLANG", "0") == "1"
+SLANG = ["מברוק", "יאללה", "אינשאללה", "וואלה", "סבבה", "אחלה", "חביבי", "יעני"]
+
+SLANG_RULES = """
+Extra language rule: formal broadcast Hebrew only. Never use Arabic loanwords, slang or
+greetings such as מברוק, יאללה, אינשאללה, וואלה, סבבה, אחלה, חביבי, יעני. The greeting is
+"שלום וברוכים הבאים" only.
+"""
 
 THUMB_RULES = """
 Also add the key "thumbnail_text": 2 to 4 Hebrew words (max 22 characters) for the
@@ -359,7 +371,8 @@ def main():
     words = int(TARGET_MINUTES * WORDS_PER_MIN)
     min_words = int(words * 0.85)
 
-    template = PROMPT.replace("POSTS:\n__POSTS__", THUMB_RULES + "\nPOSTS:\n__POSTS__") if THUMB_TEXT else PROMPT
+    extra = (THUMB_RULES if THUMB_TEXT else "") + (SLANG_RULES if NO_SLANG else "")
+    template = PROMPT.replace("POSTS:\n__POSTS__", extra + "\nPOSTS:\n__POSTS__") if extra else PROMPT
     prompt = (template.replace("__MAX_STORIES__", str(MAX_STORIES))
                     .replace("__MIN_WORDS__", str(min_words))
                     .replace("__WORDS__", str(words))
@@ -378,6 +391,15 @@ def main():
         all_changes += edit_pass(script, api_key, used_model, EDITOR_PROMPT, "Proofreading (editor)")
 
     script = clean_script(script)
+
+    if INTRO_TEMPLATE.strip():
+        script["intro"] = INTRO_TEMPLATE.replace("{weekday}", weekday_he).replace("{date}", date_he)
+        print(f"Intro (fixed): {script['intro']}")
+    if NO_SLANG:
+        texts = [script.get("intro", ""), script.get("outro", "")] + [s.get("narration", "") for s in script["segments"]]
+        found = sorted({w for w in SLANG for t in texts if w in t})
+        if found:
+            print(f"[!] slang left in the narration: {found}")
 
     if DESC_SOURCES:
         channels = ", ".join(sorted(data.get("channels", {}).keys()))
