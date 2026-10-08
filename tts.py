@@ -45,6 +45,9 @@ GLITCH_FIX = os.getenv("TTS_GLITCH_FIX", "0") == "1"
 # Shift every phrase to the same average voice pitch (the voice drifts within and between requests).
 PITCH_MATCH = os.getenv("TTS_PITCH_MATCH", "0") == "1"
 PITCH_MAX = float(os.getenv("TTS_PITCH_MAX", "0.15"))        # largest shift, as a ratio (0.15 = +-15%)
+# Reject a response longer than this many seconds per word: the model read the text twice.
+# Normal Hebrew reading is ~0.43 s/word. 0 = no check (default).
+MAX_SEC_PER_WORD = float(os.getenv("TTS_MAX_SEC_PER_WORD", "0") or 0)
 
 PAUSE = float(os.getenv("TTS_PAUSE", "0.6"))
 DEEP_EQ = os.getenv("TTS_DEEP_EQ", "0") == "1"
@@ -272,6 +275,14 @@ def gemini_synth(text, wav_path, api_key, timeout=300):
                     pcm, cut = strip_glitch(pcm, rate)
                     if cut:
                         print(f"  removed {cut:.2f}s glitch at the end of the response")
+                if MAX_SEC_PER_WORD > 0:
+                    words = len(text.split())
+                    secs = len(pcm) / 2 / rate
+                    if secs > words * MAX_SEC_PER_WORD + 3:
+                        print(f"  {model}: {secs:.0f}s of audio for {words} words - "
+                              f"the voice repeated itself, asking again")
+                        time.sleep(10)
+                        continue
                 with wave.open(str(wav_path), "wb") as w:
                     w.setnchannels(1)
                     w.setsampwidth(2)
