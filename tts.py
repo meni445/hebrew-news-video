@@ -40,6 +40,11 @@ TAIL_GUARD = os.getenv("TTS_TAIL_GUARD", "0") == "1"
 # Bring every part to the same loudness so the voice doesn't jump between stories. Off by default.
 LEVEL = os.getenv("TTS_LEVEL", "0") == "1"
 LEVEL_DB = float(os.getenv("TTS_LEVEL_DB", "-20"))
+# Gemini puts a loud ~0.1 s glitch after the last word of every response. Remove it. Off by default.
+GLITCH_FIX = os.getenv("TTS_GLITCH_FIX", "0") == "1"
+# Shift every phrase to the same average voice pitch (the voice drifts within and between requests).
+PITCH_MATCH = os.getenv("TTS_PITCH_MATCH", "0") == "1"
+PITCH_MAX = float(os.getenv("TTS_PITCH_MAX", "0.15"))        # largest shift, as a ratio (0.15 = +-15%)
 
 PAUSE = float(os.getenv("TTS_PAUSE", "0.6"))
 DEEP_EQ = os.getenv("TTS_DEEP_EQ", "0") == "1"
@@ -263,6 +268,10 @@ def gemini_synth(text, wav_path, api_key, timeout=300):
                     pcm = pcm[:-1]
                 m = re.search(r"rate=(\d+)", inline.get("mimeType", ""))
                 rate = int(m.group(1)) if m else 24000
+                if GLITCH_FIX:
+                    pcm, cut = strip_glitch(pcm, rate)
+                    if cut:
+                        print(f"  removed {cut:.2f}s glitch at the end of the response")
                 with wave.open(str(wav_path), "wb") as w:
                     w.setnchannels(1)
                     w.setsampwidth(2)
@@ -278,6 +287,38 @@ def gemini_synth(text, wav_path, api_key, timeout=300):
             print(f"  {model} HTTP {r.status_code}: {short_error(r)} -> next model")
             break
     return False
+
+
+def strip_glitch(pcm, sr):
+    """Drop short loud islands after silence at the end of a response (Gemini adds one)."""
+    import numpy as np
+    data = np.frombuffer(pcm, dtype=np.int16).astype(np.float32)
+    flen = max(1, int(sr * 0.02))
+    total_cut = 0.0
+    for _ in range(3):
+        nf = len(data) // flen
+        if nf < 20:
+            break
+        x = data[:nf * flen].reshape(nf, flen)
+        db = 20 * np.log10(np.sqrt((x ** 2).mean(axis=1)) / 32768 + 1e-9)
+        quiet = db < -45
+        k = nf - 1
+        while k >= 0 and quiet[k]:
+            k -= 1
+        end = k
+        while k >= 0 and not quiet[k]:
+            k -= 1
+        island = end - k                                   # frames of the last sound
+        gap = 0
+        while k >= 0 and quiet[k]:
+            k -= 1
+            gap += 1
+        if end < 0 or island > 15 or gap < 8 or k < 0:      # >0.3 s sound or <0.16 s gap: real speech
+            break
+        cut_at = (k + 1 + gap // 2) * flen
+        total_cut += (len(data) - cut_at) / sr
+        data = data[:cut_at]
+    return data.astype(np.int16).tobytes(), total_cut
 
 
 # ---------------- single request: split at the pauses ----------------
@@ -457,6 +498,90 @@ def level_part(path, target_db):
     write_wav(path, data, sr)
     return gain_db
 
+def f0_track(data, sr):
+    """Voice pitch per 20 ms frame (NaN where unvoiced)."""
+    import numpy as np
+    fl, hop = int(sr * 0.04), int(sr * 0.02)
+    lo, hi = int(sr / 300), int(sr / 60)
+    out = []
+    for i in range(0, max(0, len(data) - fl), hop):
+        x = data[i:i + fl] - data[i:i + fl].mean()
+        if np.sqrt((x ** 2).mean()) < 32768 * 10 ** (-32 / 20):
+            out.append(np.nan)
+            continue
+        ac = np.correlate(x, x, "full")[fl - 1:]
+        k = lo + int(np.argmax(ac[lo:hi]))
+        out.append(sr / k if ac[k] > 0.45 * ac[0] else np.nan)
+    return np.array(out)
+
+
+def phrases(data, sr):
+    """(start, end) samples of the phrases between pauses."""
+    bounds, last = [], 0
+    for a, b in find_pauses(data, sr, min_len=0.18):
+        mid = int((a + b) / 2 * sr)
+        if mid > last:
+            bounds.append((last, mid))
+            last = mid
+    bounds.append((last, len(data)))
+    return [(a, b) for a, b in bounds if b > a]
+
+
+def shift_pitch(chunk, sr, ratio, tmp_dir):
+    """Pitch-shift without changing the length (rubberband, formants kept)."""
+    import numpy as np
+    src, dst = tmp_dir / "ps_in.wav", tmp_dir / "ps_out.wav"
+    write_wav(src, chunk, sr)
+    r = subprocess.run(["ffmpeg", "-y", "-i", str(src), "-af",
+                        f"rubberband=pitch={ratio:.4f}:formant=preserved",
+                        "-ar", str(sr), "-ac", "1", "-c:a", "pcm_s16le", str(dst)],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    if r.returncode != 0:                                   # raise, so the caller keeps the voice as is
+        raise RuntimeError(r.stderr[-300:])
+    out, _ = read_wav(dst)
+    if len(out) < len(chunk):
+        out = np.concatenate([out, np.zeros(len(chunk) - len(out), dtype=np.float32)])
+    return out[:len(chunk)]
+
+
+def match_pitch(paths, tmp_dir):
+    """Bring every phrase of every part to the overall median pitch. Returns the target Hz."""
+    import numpy as np
+    tracks = {}
+    for pid, path in paths.items():
+        data, sr = read_wav(path)
+        tracks[pid] = (data, sr, f0_track(data, sr))
+    voiced = np.concatenate([t[~np.isnan(t)] for _, _, t in tracks.values()])
+    if len(voiced) < 50:
+        return None
+    target = float(np.median(voiced))
+    for pid, (data, sr, f0) in tracks.items():
+        out = data.copy()
+        shifts = []
+        for a, b in phrases(data, sr):
+            fa, fb = a // int(sr * 0.02), b // int(sr * 0.02)
+            v = f0[fa:fb]
+            v = v[~np.isnan(v)]
+            if (b - a) < sr * 0.8 or len(v) < 12:
+                continue
+            ratio = max(1 - PITCH_MAX, min(1 + PITCH_MAX, target / float(np.median(v))))
+            if abs(ratio - 1) < 0.02:
+                continue
+            seg = shift_pitch(data[a:b], sr, ratio, tmp_dir)
+            fade = min(int(sr * 0.01), (b - a) // 4)
+            if fade > 0:                                   # tiny crossfade at phrase edges
+                ramp = np.linspace(0, 1, fade, dtype=np.float32)
+                seg[:fade] = seg[:fade] * ramp + data[a:a + fade] * (1 - ramp)
+                seg[-fade:] = seg[-fade:] * ramp[::-1] + data[b - fade:b] * (1 - ramp[::-1])
+            out[a:b] = seg
+            shifts.append(ratio)
+        write_wav(paths[pid], out, sr)
+        if shifts:
+            print(f"  {pid}: {len(shifts)} phrase(s) shifted, "
+                  f"{(min(shifts) - 1) * 100:+.0f}% .. {(max(shifts) - 1) * 100:+.0f}%")
+    return target
+
+
 def clean_edges(path):
     """Trim non-speech noise at both ends of a mono 16-bit WAV and fade the edges."""
     import numpy as np
@@ -603,6 +728,14 @@ async def main():
             except Exception as e:
                 print(f"  [!] tail guard failed for {p['id']} ({e})")
 
+    if PITCH_MATCH:
+        try:
+            target = match_pitch(wavs, audio_dir)
+            if target:
+                print(f"Pitch matched to {target:.0f} Hz")
+        except Exception as e:
+            print(f"[!] pitch matching failed ({e}), keeping the voice as is")
+
     if LEVEL:
         print(f"Leveling parts to {LEVEL_DB:g} dB")
         for p in parts:
@@ -645,6 +778,7 @@ async def main():
                 "voice": GEMINI_TTS_VOICE if used == "gemini" else VOICE,
                 "deep_eq": DEEP_EQ, "niqqud": NIQQUD, "pause": PAUSE, "clean": CLEAN,
                 "chunk_words": CHUNK_WORDS, "tail_guard": TAIL_GUARD, "level": LEVEL,
+                "glitch_fix": GLITCH_FIX, "pitch_match": PITCH_MATCH,
                 "total_duration": round(duration(narration), 3),
                 "narration": "audio/narration.mp3", "parts": parts}
     (day_dir / "audio.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2),
