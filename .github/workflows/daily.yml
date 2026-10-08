@@ -2,12 +2,45 @@ name: Daily news video
 
 on:
   workflow_dispatch:
-  # GitHub cron is UTC: 01:00 UTC = 04:00 Israel summer time / 03:00 winter time.
+  # GitHub cron is UTC (Israel = UTC+3 in summer, UTC+2 in winter) and GitHub often starts
+  # scheduled runs hours late. So there are 5 tries in the evening; the first one that runs
+  # makes the video and the guard job makes the later ones stop after a few seconds.
+  # 19:47 UTC = 22:47 Israel summer / 21:47 winter ... last try 23:47 UTC = 02:47 / 01:47.
   schedule:
-    - cron: "37 0 * * *"
+    - cron: "47 19 * * *"
+    - cron: "47 20 * * *"
+    - cron: "47 21 * * *"
+    - cron: "47 22 * * *"
+    - cron: "47 23 * * *"
+
+# never two runs at the same time; a waiting run starts after the current one and the guard stops it
+concurrency:
+  group: daily-news-video
+  cancel-in-progress: false
 
 jobs:
+  guard:
+    runs-on: ubuntu-24.04
+    outputs:
+      skip: ${{ steps.check.outputs.skip }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Already published recently?
+        id: check
+        env:
+          YT_CLIENT_ID: ${{ secrets.YT_CLIENT_ID }}
+          YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
+          YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
+          GUARD_HOURS: "14"
+        run: |
+          pip install requests
+          python guard.py
+
   run:
+    needs: guard
+    if: needs.guard.outputs.skip != 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 180
     steps:
@@ -89,6 +122,9 @@ jobs:
           TTS_PAUSE: "0.6"
           TTS_CLEAN: "1"
           TTS_SINGLE: "1"
+          TTS_CHUNK_WORDS: "160"
+          TTS_TAIL_GUARD: "1"
+          TTS_LEVEL: "1"
         run: python tts.py
 
       - name: Avatar lip-sync (Wav2Lip)
