@@ -91,6 +91,8 @@ jobs:
           MAX_STORIES: "8"
           DESC_SOURCES: "0"
           THUMB_TEXT: "1"
+          NO_SLANG: "1"
+          INTRO_TEMPLATE: "שלום וברוכים הבאים לחדשות היום. זהו סיכום החדשות של יום {weekday}, {date}, כל מה שחשוב לדעת מהיממה האחרונה בארץ ובעולם."
         run: python script.py
 
       - name: Download news media (Telegram + check)
@@ -125,6 +127,8 @@ jobs:
           TTS_CHUNK_WORDS: "160"
           TTS_TAIL_GUARD: "1"
           TTS_LEVEL: "1"
+          TTS_GLITCH_FIX: "1"
+          TTS_PITCH_MATCH: "1"
         run: python tts.py
 
       - name: Avatar lip-sync (Wav2Lip)
